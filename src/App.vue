@@ -26,7 +26,9 @@ const closeToTray=ref(localStorage.getItem('closeToTray')==='on'),trayAvailable=
 let unlistenTraySync:UnlistenFn|undefined,unlistenTrayQuit:UnlistenFn|undefined
 let closingMain=false
 const startupError=ref('')
-let allowClose=false
+async function closeDetachedCompose(){
+  try{await api.closeComposer()}catch(e){error.value=errorText(e)}
+}
 let unlistenDrafts:UnlistenFn|undefined,unlistenClose:UnlistenFn|undefined
 const searchInput=ref<HTMLInputElement|null>(null)
 const t=(en:string,cn:string)=>zh.value?cn:en
@@ -369,7 +371,7 @@ async function persistDraft(close:boolean){
   draftId.value=await api.saveDraft(draftId.value,snapshot)
   savedRevision.value=current
   await refreshDrafts()
-  if(close&&revision.value===current){if(detachedCompose){allowClose=true;await getCurrentWindow().close()}else dialog.value=null}
+  if(close&&revision.value===current){if(detachedCompose){await closeDetachedCompose()}else dialog.value=null}
   status.value=t('Draft saved locally.','草稿已保存到本地。')
 }
 async function saveDraft(){await run(async()=>{await persistDraft(true)})}
@@ -388,7 +390,7 @@ async function send(){
     const id=deliveryRequestId.value
     const item=await api.enqueue(id,{...draft.value,attachments:[...(draft.value.attachments||[])]},due,draftId.value)
     dialog.value=null;draftId.value=null;draft.value=blankCompose();savedRevision.value=revision.value
-    if(detachedCompose){allowClose=true;await getCurrentWindow().close();return}
+    if(detachedCompose){await closeDetachedCompose();return}
     await refreshDrafts();await refreshOutbox();view(null,'outbox')
     status.value=due?t('Scheduled in the local outbox.','已加入本地定时发送队列。'):t('Queued for delivery.','已加入发件队列。')
     if(!due&&item.state==='queued'){
@@ -451,12 +453,12 @@ onMounted(async()=>{
       const item=await api.draft(detachedDraftId)
       startCompose(item.mail,item.id)
       unlistenClose=await getCurrentWindow().onCloseRequested(e=>{
-        if(allowClose)return
-        if(busy.value){e.preventDefault();return}
-        if(dirty.value){
-          e.preventDefault()
-          if(confirm(t('Close without saving the latest changes? The last saved draft is retained.','关闭且不保存最近修改？已保存的草稿仍会保留。'))){allowClose=true;void getCurrentWindow().close()}
-        }
+        // Tauri's default close listener would invoke unrestricted destroy().
+        // Route all confirmed editor closes through the label-bound native command.
+        e.preventDefault()
+        if(busy.value)return
+        if(dirty.value&&!confirm(t('Close without saving the latest changes? The last saved draft is retained.','关闭且不保存最近修改？已保存的草稿仍会保留。')))return
+        void closeDetachedCompose()
       })
     }else{
       await refreshDrafts();await refreshOutbox();await load()
@@ -595,7 +597,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
     </section>
   </main>
   <footer v-if="!detachedCompose" role="status"><span>{{busy?t('Working…','处理中…'):t('Ready','就绪')}}</span><span>{{status}}</span><span class="error" v-if="error">{{error}}</span></footer>
-  <div v-if="detachedCompose&&startupError" class="empty reading-empty"><p class="error">{{startupError}}</p><button @click="getCurrentWindow().close()">{{t('Close','关闭')}}</button></div>
+  <div v-if="detachedCompose&&startupError" class="empty reading-empty"><p class="error">{{startupError}}</p><button @click="closeDetachedCompose">{{t('Close','关闭')}}</button></div>
   <div class="overlay" v-if="dialog" @click.self="closeDialog">
     <form v-if="dialog==='account'" class="modal" @submit.prevent="saveAccount">
       <div class="modal-head"><h2>{{editId?t('Edit mailbox','编辑邮箱'):t('Add mailbox','添加邮箱')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>

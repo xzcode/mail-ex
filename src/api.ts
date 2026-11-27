@@ -110,6 +110,7 @@ export const api = {
   invitationReply: (id:number,index:number,accountId:string,partstat:string) => invoke<Compose>('invitation_reply',{id,index,accountId,partstat}),
   meetingInvite: (id:string,accountId:string,recipients:string) => invoke<Compose>('meeting_invitation',{id,accountId,recipients}),
   openComposer: (id:string) => invoke<void>('open_compose_window',{id}),
+  closeComposer: () => invoke<void>('close_compose_window'),
   openReader: (id:number) => invoke<void>('open_reader_window',{id}),
   readerSnapshot: () => invoke<ReaderSnapshot>('reader_snapshot'),
   frontendReady: () => invoke<void>('frontend_ready'),

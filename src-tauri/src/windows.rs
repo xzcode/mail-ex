@@ -23,10 +23,18 @@ pub async fn open_compose_window(app:AppHandle,id:String)->Result<(),String>{
     if let Some(window)=app.get_webview_window(&label){return bring_to_front(&window)}
     work(app.clone(),move|s|{s.draft(&id)?;Ok(())}).await?;
     match WebviewWindowBuilder::new(&app,&label,WebviewUrl::App("index.html".into()))
-        .title("Mail EX — Compose").inner_size(880.0,760.0).min_inner_size(600.0,500.0).build(){
+        .title("Mail EX — Compose").center().inner_size(880.0,760.0).min_inner_size(600.0,500.0).build(){
         Ok(window)=>bring_to_front(&window),
         Err(e)=>{if let Some(window)=app.get_webview_window(&label){bring_to_front(&window)}else{Err(e.to_string())}}
     }
+}
+// The caller is supplied by Tauri, not by a user-controlled window label.
+#[tauri::command]
+pub async fn close_compose_window(window:WebviewWindow)->Result<(),String>{
+    let id=window.label().strip_prefix("compose-").ok_or_else(||"Only a compose window may close itself".to_string())?;
+    let uuid=uuid::Uuid::parse_str(id).map_err(|_|"Invalid compose window label".to_string())?;
+    if uuid.to_string()!=id{return Err("Invalid compose window label".into())}
+    window.destroy().map_err(|e|e.to_string())
 }
 #[tauri::command]
 pub async fn open_reader_window(app:AppHandle,id:i64)->Result<(),String>{
