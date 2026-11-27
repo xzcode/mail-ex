@@ -239,7 +239,10 @@ impl Store{
             check_snapshot(&snapshot,&schema_signature(&self.db)?)?;
             verify_vault(&snapshot,&self.key)?;
             drop(snapshot);
-            File::open(&destination)?.sync_all()?;
+            // Windows FlushFileBuffers requires a handle opened for writing.
+            // The snapshot is our private newly-created database, never a live DB.
+            OpenOptions::new().read(true).write(true).open(&destination)?
+                .sync_all().context("Cannot flush snapshot database to disk")?;
             let mut key_file=private_file(&path.join(KEY))?;key_file.write_all(&self.key)?;key_file.sync_all()?;
             if portable{
                 let manifest=Manifest{format:"mail-ex-backup".into(),version:1,schema:SCHEMA,db_sha256:hash_file(&destination)?,key_sha256:hash_file(&path.join(KEY))?};

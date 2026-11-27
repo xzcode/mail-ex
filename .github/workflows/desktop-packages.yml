@@ -8,7 +8,7 @@ on:
         required: true
         default: desktop
         type: choice
-        options: [desktop, all, linux]
+        options: [desktop, all, linux, windows, macos]
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.platforms == 'linux' && '[{"os":"ubuntu-24.04","bundles":"deb","artifact":"linux-x64"}]' || inputs.platforms == 'all' && '[{"os":"ubuntu-24.04","bundles":"deb","artifact":"linux-x64"},{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"},{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]' || '[{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"},{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]') }}
+        include: ${{ fromJSON(inputs.platforms == 'windows' && '[{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"}]' || inputs.platforms == 'macos' && '[{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]' || inputs.platforms == 'linux' && '[{"os":"ubuntu-24.04","bundles":"deb","artifact":"linux-x64"}]' || inputs.platforms == 'all' && '[{"os":"ubuntu-24.04","bundles":"deb","artifact":"linux-x64"},{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"},{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]' || '[{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"},{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
