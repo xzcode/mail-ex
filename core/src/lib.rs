@@ -10,6 +10,8 @@ use uuid::Uuid;
 mod mime;
 mod oauth;
 mod organizer;
+mod portability;
+pub use portability::{ImportReport,StorageStats,CacheReport,SnapshotReport,ARCHIVE_ID};
 pub use organizer::{Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem};
 pub use oauth::OAuthRequest;
 pub use mime::{AttachmentInfo, AttachmentPreview, OutgoingAttachment};
@@ -106,7 +108,7 @@ fn decrypt(key: &[u8;32], id: &str, bytes: &[u8])->Result<String>{
     String::from_utf8(plain).context("Invalid credential encoding")
 }
 
-pub struct Store { db: Connection, key: [u8;32] }
+pub struct Store { db: Connection, key: [u8;32], dir: std::path::PathBuf }
 impl Store {
     pub fn open(dir: &Path)->Result<Self>{
         fs::create_dir_all(dir)?;
@@ -115,11 +117,11 @@ impl Store {
         db.busy_timeout(Duration::from_secs(15))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let initial_version:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if initial_version>6 { bail!("Database belongs to a newer Mail EX version") }
-        if initial_version<6 {
+        if initial_version>7 { bail!("Database belongs to a newer Mail EX version") }
+        if initial_version<7 {
         let migration=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version:i64=migration.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version>6 { bail!("Database belongs to a newer Mail EX version") }
+        if version>7 { bail!("Database belongs to a newer Mail EX version") }
         if version==0 {
             migration.execute_batch("CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL, imap_port INTEGER NOT NULL, smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL, smtp_starttls INTEGER NOT NULL, color TEXT NOT NULL, secret BLOB NOT NULL);
               CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, folder TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, timestamp INTEGER NOT NULL, seen INTEGER NOT NULL, body TEXT NOT NULL, html_only INTEGER NOT NULL, raw BLOB NOT NULL, UNIQUE(account_id,folder,uid_validity,uid));
@@ -171,6 +173,7 @@ impl Store {
             for (id,body) in updates{migration.execute("UPDATE messages SET body=? WHERE id=?",params![body,id])?;}
         }
         if version<6 { organizer::migrate(&migration)?; }
+        if version<7 { portability::migrate(&migration)?; }
         migration.commit()?;
         }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(dir.join("mail.sqlite3"),fs::Permissions::from_mode(0o600))?; }
@@ -178,7 +181,7 @@ impl Store {
             let count:i64=db.query_row("SELECT count(*) FROM accounts",[],|r|r.get(0))?;
             if count>0 {bail!("Credential key is missing; restore the original key")}
         }
-        let key=load_key(dir)?; Ok(Self{db,key})
+        let key=load_key(dir)?; Ok(Self{db,key,dir:dir.to_path_buf()})
     }
     pub fn accounts(&self)->Result<Vec<Account>>{
         let mut s=self.db.prepare(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts ORDER BY name,id"))?;
@@ -192,7 +195,8 @@ impl Store {
         decrypt(&self.key,id,&bytes)
     }
     fn credential(&self,a:&Account)->Result<String>{
-        if a.auth_kind=="password"{return self.password(&a.id)}
+        if a.auth_kind=="local"{bail!("Local archives have no network credentials")}
+        if a.auth_kind=="password"{let pw=self.password(&a.id)?;if pw.is_empty(){bail!("Imported account requires a password or authorization code")}return Ok(pw)}
         let provider=oauth::Provider::parse(&a.auth_kind)?;
         let (imap,smtp,port,starttls)=provider.servers();
         if a.imap_host!=imap||a.imap_port!=993||a.smtp_host!=smtp||a.smtp_port!=port||a.smtp_starttls!=starttls||a.username!=a.email{bail!("OAuth account endpoint does not match its provider")}
@@ -261,6 +265,7 @@ impl Store {
     }
     pub fn update_account(&mut self,id:&str,input:NewAccount)->Result<Account>{
         let old=self.account(id)?;
+        if old.auth_kind=="local"{bail!("Local archive is not a network account")}
         // Changing identity or incoming endpoint would make the previous cache ambiguous.
         let username=if input.username.trim().is_empty(){input.email.trim().to_string()}else{input.username.trim().to_string()};
         if old.email!=input.email.trim() || old.username!=username || old.imap_host!=input.imap_host || old.imap_port!=input.imap_port {
@@ -427,7 +432,12 @@ impl Store {
     pub fn set_starred(&self,id:i64,starred:bool)->Result<()>{self.set_flag(id,"starred",starred)}
     fn set_flag(&self,id:i64,flag:&str,value:bool)->Result<()>{
         let (aid,folder,validity,uid)=self.message_location(id)?;
-        let a=self.account(&aid)?;let pw=self.credential(&a)?;
+        let a=self.account(&aid)?;
+        if a.auth_kind=="local"{
+            let sql=if flag=="seen"{"UPDATE messages SET seen=? WHERE id=? AND account_id=?"}else{"UPDATE messages SET starred=? WHERE id=? AND account_id=?"};
+            self.db.execute(sql,params![value,id,aid])?;return Ok(())
+        }
+        let pw=self.credential(&a)?;
         let mut session=connect_imap(&a,&pw)?;
         let mailbox=session.select(&folder).context("Cannot select mailbox")?;
         if mailbox.uid_validity!=Some(validity){bail!("Mailbox identity changed; sync before updating")}
@@ -471,7 +481,7 @@ impl Store {
         Ok(draft)
     }
     pub fn save_draft(&self,id:Option<String>,mail:Compose)->Result<String>{
-        self.account(&mail.account_id)?;
+        if self.account(&mail.account_id)?.auth_kind=="local"{bail!("Select a real sending mailbox")}
         let id=match id{Some(id)=>{Uuid::parse_str(&id).context("Invalid draft ID")?;id},None=>Uuid::new_v4().to_string()};
         let attachments=serde_json::to_string(&mail.attachments)?;
         let html=mail.html.map(|s|mime::sanitize_html(&s));
@@ -481,7 +491,8 @@ impl Store {
     pub fn delete_draft(&self,id:&str)->Result<()>{self.db.execute("DELETE FROM drafts WHERE id=?",[id])?;Ok(())}
     pub fn compose_from(&self,id:i64,mode:&str)->Result<Compose>{
         let m=self.message(id)?;
-        let account=self.account(&m.summary.account_id)?;
+        let origin=self.account(&m.summary.account_id)?;
+        let account=if origin.auth_kind=="local"{self.accounts()?.into_iter().find(|a|a.auth_kind!="local").ok_or_else(||anyhow!("Add a sending mailbox before replying or forwarding imported mail"))?}else{origin};
         let raw:Vec<u8>=self.db.query_row("SELECT raw FROM messages WHERE id=?",[id],|r|r.get(0))?;
         let parsed=mailparse::parse_mail(&raw).context("Cannot read original message headers")?;
         let h=parsed.get_headers();
@@ -533,6 +544,7 @@ impl Store {
 }
 
 fn prepare_message(a:&Account,mail:Compose)->Result<Message>{
+    if a.auth_kind=="local"{bail!("Select a real sending mailbox")}
     let mut builder=Message::builder().from(a.email.parse().map_err(|_|anyhow!("Invalid sender address"))?).subject(mail.subject);
     let recipients=addresses(&mail.to)?;
     if recipients.is_empty(){bail!("At least one recipient is required")}

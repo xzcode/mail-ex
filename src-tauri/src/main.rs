@@ -1,14 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport,Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem};
+use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport,Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem,ImportReport,StorageStats,CacheReport,SnapshotReport};
 use tauri::{AppHandle,Manager,Emitter};
 use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
 static OAUTH:Mutex<Option<Arc<AtomicBool>>>=Mutex::new(None);
 struct OAuthGuard;
 impl Drop for OAuthGuard {fn drop(&mut self){if let Ok(mut active)=OAUTH.lock(){*active=None;}}}
 use tauri_plugin_dialog::DialogExt;
+use std::path::{Path,PathBuf};
+use std::fs;
+use std::io::Write;
+struct DataLocation {active:PathBuf,settings:PathBuf}
+fn configured_location(settings:&Path,default:&Path)->anyhow::Result<PathBuf>{
+    if !settings.exists(){return Ok(default.to_path_buf())}
+    let path:PathBuf=serde_json::from_reader(fs::File::open(settings)?)?;
+    if !path.is_absolute()||!path.join("mail.sqlite3").is_file()||!path.join("vault.key").is_file(){anyhow::bail!("Configured mail storage is unavailable; restore the directory before starting Mail EX")}
+    Ok(path)
+}
+fn set_next_location(settings:&Path,path:&Path)->anyhow::Result<()>{
+    if !path.is_absolute(){anyhow::bail!("Storage directory must be absolute")}
+    let tmp=settings.with_extension(format!("tmp-{}",uuid::Uuid::new_v4()));
+    let result=(||->anyhow::Result<()>{let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;serde_json::to_writer(&file,path)?;file.flush()?;file.sync_all()?;drop(file);fs::rename(&tmp,settings)?;Ok(())})();
+    if result.is_err(){let _=fs::remove_file(&tmp);}result
+}
+fn picked(path:tauri_plugin_dialog::FilePath)->anyhow::Result<PathBuf>{path.into_path().map_err(|_|anyhow::anyhow!("Unsupported file destination"))}
 
 async fn work<T:Send+'static>(app:AppHandle,f:impl FnOnce(&mut Store)->anyhow::Result<T>+Send+'static)->Result<T,String>{
-    let dir=app.path().app_data_dir().map_err(|_|"Cannot resolve app data directory".to_string())?;
+    let dir=app.state::<DataLocation>().active.clone();
     tauri::async_runtime::spawn_blocking(move||{let mut store=Store::open(&dir).map_err(|e|e.to_string())?;f(&mut store).map_err(|e|e.to_string())}).await.map_err(|_|"Background task failed".to_string())?
 }
 #[tauri::command]
@@ -127,10 +144,103 @@ async fn mark_interrupted_outbox(app:AppHandle,id:String)->Result<(),String>{wor
 async fn copy_outbox(app:AppHandle,id:String)->Result<Compose,String>{work(app,move|s|s.copy_outbox(&id)).await}
 #[tauri::command]
 async fn delete_outbox(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_outbox(&id)).await}
+
+#[tauri::command]
+async fn storage_stats(app:AppHandle)->Result<StorageStats,String>{work(app,|s|s.storage_stats()).await}
+#[tauri::command]
+fn pending_storage(app:AppHandle)->Result<Option<String>,String>{
+    let state=app.state::<DataLocation>();
+    if !state.settings.exists(){return Ok(None)}
+    let path:PathBuf=serde_json::from_reader(fs::File::open(&state.settings).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    Ok(if path==state.active{None}else{Some(path.to_string_lossy().into_owned())})
+}
+#[tauri::command]
+async fn import_mail_files(app:AppHandle,format:String)->Result<Option<ImportReport>,String>{
+    let handle=app.clone();
+    work(app,move|s|{
+        if !["eml","mbox"].contains(&format.as_str()){anyhow::bail!("Unsupported mail format")}
+        let Some(paths)=handle.dialog().file().add_filter("Mail files",&[format.as_str()]).blocking_pick_files() else{return Ok(None)};
+        let paths=paths.into_iter().map(picked).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Some(s.import_mail(&paths,&format)?))
+    }).await
+}
+#[tauri::command]
+async fn export_mail_eml(app:AppHandle,id:i64)->Result<bool,String>{
+    let handle=app.clone();
+    work(app,move|s|{
+        let Some(path)=handle.dialog().file().set_file_name("message.eml").add_filter("EML",&["eml"]).blocking_save_file() else{return Ok(false)};
+        s.export_eml(id,&picked(path)?)?;Ok(true)
+    }).await
+}
+#[tauri::command]
+async fn export_mail_mbox(app:AppHandle,account_id:Option<String>,folder:Option<String>)->Result<Option<usize>,String>{
+    let handle=app.clone();
+    work(app,move|s|{
+        let Some(path)=handle.dialog().file().set_file_name("mail.mbox").add_filter("MBOX",&["mbox"]).blocking_save_file() else{return Ok(None)};
+        Ok(Some(s.export_mbox(account_id,folder,&picked(path)?)?))
+    }).await
+}
+#[tauri::command]
+async fn delete_local_mail(app:AppHandle,id:i64)->Result<(),String>{work(app,move|s|s.delete_import(id)).await}
+#[tauri::command]
+async fn import_contacts_csv(app:AppHandle)->Result<Option<ImportReport>,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().add_filter("CSV",&["csv"]).blocking_pick_file()else{return Ok(None)};Ok(Some(s.import_contacts(&picked(path)?)?))}).await
+}
+#[tauri::command]
+async fn export_contacts_csv(app:AppHandle)->Result<Option<usize>,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().set_file_name("contacts.csv").add_filter("CSV",&["csv"]).blocking_save_file()else{return Ok(None)};Ok(Some(s.export_contacts(&picked(path)?)?))}).await
+}
+#[tauri::command]
+async fn import_accounts_json(app:AppHandle)->Result<Option<ImportReport>,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().add_filter("JSON",&["json"]).blocking_pick_file()else{return Ok(None)};Ok(Some(s.import_account_config(&picked(path)?)?))}).await
+}
+#[tauri::command]
+async fn export_accounts_json(app:AppHandle)->Result<Option<usize>,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().set_file_name("mail-ex-accounts.json").add_filter("JSON",&["json"]).blocking_save_file()else{return Ok(None)};Ok(Some(s.export_account_config(&picked(path)?)?))}).await
+}
+#[tauri::command]
+async fn cache_preview(app:AppHandle,account_id:Option<String>,before:Option<i64>)->Result<CacheReport,String>{work(app,move|s|s.cache_preview(account_id,before)).await}
+#[tauri::command]
+async fn clear_cache(app:AppHandle,account_id:Option<String>,before:Option<i64>)->Result<CacheReport,String>{work(app,move|s|s.clear_cache(account_id,before)).await}
+#[tauri::command]
+async fn optimize_storage(app:AppHandle)->Result<(),String>{work(app,|s|s.optimize_storage()).await}
+#[tauri::command]
+async fn create_backup(app:AppHandle)->Result<Option<SnapshotReport>,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().set_title("Choose backup parent directory").blocking_pick_folder()else{return Ok(None)};Ok(Some(s.create_backup(&picked(path)?)?))}).await
+}
+#[tauri::command]
+async fn restore_backup(app:AppHandle)->Result<Option<SnapshotReport>,String>{
+    let handle=app.clone();let settings=app.state::<DataLocation>().settings.clone();
+    work(app,move|s|{
+        let Some(source)=handle.dialog().file().set_title("Choose trusted Mail EX backup folder").blocking_pick_folder()else{return Ok(None)};
+        let Some(parent)=handle.dialog().file().set_title("Choose parent directory for restored data").blocking_pick_folder()else{return Ok(None)};
+        let result=s.restore_backup(&picked(source)?,&picked(parent)?)?;
+        set_next_location(&settings,Path::new(&result.directory))?;Ok(Some(result))
+    }).await
+}
+#[tauri::command]
+async fn copy_storage(app:AppHandle)->Result<Option<SnapshotReport>,String>{
+    let handle=app.clone();let settings=app.state::<DataLocation>().settings.clone();
+    work(app,move|s|{
+        let Some(parent)=handle.dialog().file().set_title("Choose parent directory for copied data").blocking_pick_folder()else{return Ok(None)};
+        let result=s.copy_storage(&picked(parent)?)?;
+        set_next_location(&settings,Path::new(&result.directory))?;Ok(Some(result))
+    }).await
+}
+
 fn main(){
     tauri::Builder::default().plugin(tauri_plugin_dialog::init()).setup(|app| {
-        let dir=app.path().app_data_dir()?;
+        let root=app.path().app_data_dir()?;
+        fs::create_dir_all(&root)?;
+        let settings=root.join("storage-location.json");
+        let dir=configured_location(&settings,&root)?;
         Store::open(&dir)?;
+        app.manage(DataLocation{active:dir.clone(),settings});
         let handle=app.handle().clone();
         std::thread::spawn(move||loop {
             let result=Store::open(&dir).and_then(|mut store|store.dispatch_outbox(None));
@@ -138,5 +248,5 @@ fn main(){
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
         Ok(())
-    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
+    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox,storage_stats,pending_storage,import_mail_files,export_mail_eml,export_mail_mbox,delete_local_mail,import_contacts_csv,export_contacts_csv,import_accounts_json,export_accounts_json,cache_preview,clear_cache,optimize_storage,create_backup,restore_backup,copy_storage]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
 }

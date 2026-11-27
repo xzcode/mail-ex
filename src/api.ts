@@ -1,6 +1,10 @@
 import { invoke } from '@tauri-apps/api/core'
-export interface Account { id:string; name:string; email:string; username:string; imap_host:string; imap_port:number; smtp_host:string; smtp_port:number; smtp_starttls:boolean; color:string; signature:string; auth_kind:'password'|'google'|'microsoft'|'outlook' }
+export interface Account { id:string; name:string; email:string; username:string; imap_host:string; imap_port:number; smtp_host:string; smtp_port:number; smtp_starttls:boolean; color:string; signature:string; auth_kind:'password'|'google'|'microsoft'|'outlook'|'local' }
 export type NewAccount = Omit<Account,'id'|'auth_kind'> & { password:string }
+export interface ImportReport { added:number; skipped:number; invalid:number }
+export interface StorageStats { directory:string; database_bytes:number; wal_bytes:number; shm_bytes:number; raw_mail_bytes:number; messages:number; local_messages:number; accounts:number; contacts:number; drafts:number; outbox:number }
+export interface CacheReport { messages:number; raw_bytes:number }
+export interface SnapshotReport { directory:string; suspended_sends:number }
 export interface OAuthRequest { provider:'google'|'microsoft'|'outlook'; client_id:string; desktop_client_secret:string; email:string; name:string; color:string; account_id:string|null }
 export interface SearchFilters { sender:string; recipient:string; subject:string; since:number|null; until:number|null; label?:string }
 export interface Contact { id:string; email:string; name:string; group_name:string; notes:string }
@@ -68,5 +72,21 @@ export const api = {
   cancelOutbox: (id:string) => invoke<void>('cancel_outbox',{id}),
   interruptOutbox: (id:string) => invoke<void>('mark_interrupted_outbox',{id}),
   copyOutbox: (id:string) => invoke<Compose>('copy_outbox',{id}),
-  deleteOutbox: (id:string) => invoke<void>('delete_outbox',{id})
+  deleteOutbox: (id:string) => invoke<void>('delete_outbox',{id}),
+  storageStats: () => invoke<StorageStats>('storage_stats'),
+  pendingStorage: () => invoke<string|null>('pending_storage'),
+  importMail: (format:'eml'|'mbox') => invoke<ImportReport|null>('import_mail_files',{format}),
+  exportEml: (id:number) => invoke<boolean>('export_mail_eml',{id}),
+  exportMbox: (accountId:string|null,folder:string|null) => invoke<number|null>('export_mail_mbox',{accountId,folder}),
+  deleteLocalMail: (id:number) => invoke<void>('delete_local_mail',{id}),
+  importContactsCsv: () => invoke<ImportReport|null>('import_contacts_csv'),
+  exportContactsCsv: () => invoke<number|null>('export_contacts_csv'),
+  importAccountsJson: () => invoke<ImportReport|null>('import_accounts_json'),
+  exportAccountsJson: () => invoke<number|null>('export_accounts_json'),
+  cachePreview: (accountId:string|null,before:number|null) => invoke<CacheReport>('cache_preview',{accountId,before}),
+  clearCache: (accountId:string|null,before:number|null) => invoke<CacheReport>('clear_cache',{accountId,before}),
+  optimizeStorage: () => invoke<void>('optimize_storage'),
+  createBackup: () => invoke<SnapshotReport|null>('create_backup'),
+  restoreBackup: () => invoke<SnapshotReport|null>('restore_backup'),
+  copyStorage: () => invoke<SnapshotReport|null>('copy_storage')
 }

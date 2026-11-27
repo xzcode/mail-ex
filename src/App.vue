@@ -5,6 +5,7 @@ import {listen,type UnlistenFn} from '@tauri-apps/api/event'
 import OrganizerPanel from './components/OrganizerPanel.vue'
 import RecipientField from './components/RecipientField.vue'
 import RichEditor from './components/RichEditor.vue'
+import DataPanel from './components/DataPanel.vue'
 
 type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'|'outbox'
 type OrganizerTab='contacts'|'templates'|'rules'|'searches'
@@ -21,6 +22,8 @@ watch(listWidth,v=>localStorage.setItem('listWidth',String(v)))
 const accounts=ref<Account[]>([]), folders=ref<Folder[]>([]), messages=ref<Summary[]>([]), drafts=ref<Draft[]>([])
 const selected=ref<Mail|null>(null), expanded=ref<string[]>([])
 const contacts=ref<Contact[]>([]),templates=ref<MailTemplate[]>([]),savedSearches=ref<SavedSearch[]>([]),labels=ref<LabelCount[]>([]),messageLabels=ref<string[]>([]),outbox=ref<OutboxItem[]>([])
+const dataPanel=ref(false)
+const sendingAccounts=computed(()=>accounts.value.filter(a=>a.auth_kind!=='local'))
 const organizerTab=ref<OrganizerTab|null>(null),activeSavedId=ref(''),templateChoice=ref(''),templateName=ref('')
 const scheduleEnabled=ref(false),scheduleAt=ref(''),deliveryRequestId=ref('')
 let unlistenOutbox:UnlistenFn|undefined
@@ -73,7 +76,7 @@ async function applyBatch(operation:BatchOperation){
 }
 function startOAuth(account?:Account){
   if(busy.value)return
-  if(account?.auth_kind==='password')return
+  if(account?.auth_kind==='password'||account?.auth_kind==='local')return
   oauthForm.value={provider:account?.auth_kind||'google',client_id:'',desktop_client_secret:'',email:account?.email||form.value.email,name:account?.name||form.value.name,color:account?.color||form.value.color,account_id:account?.id||null}
   error.value='';dialog.value='oauth'
 }
@@ -98,7 +101,7 @@ async function cancelOAuth(){
 }
 const blankAccount=():NewAccount=>({name:'',email:'',username:'',password:'',imap_host:'',imap_port:993,smtp_host:'',smtp_port:465,smtp_starttls:false,color:'#507ed8',signature:''})
 const form=ref<NewAccount>(blankAccount())
-const blankCompose=():Compose=>({account_id:accountId.value||accounts.value[0]?.id||'',to:'',cc:'',bcc:'',subject:'',body:'',html:null,attachments:[],save_sent_copy:false})
+const blankCompose=():Compose=>({account_id:sendingAccounts.value.some(a=>a.id===accountId.value)?accountId.value!:sendingAccounts.value[0]?.id||'',to:'',cc:'',bcc:'',subject:'',body:'',html:null,attachments:[],save_sent_copy:false})
 const draft=ref<Compose>(blankCompose())
 const revision=ref(0),savedRevision=ref(0),autosave=ref(localStorage.getItem('draftAutosave')!=='off')
 watch(draft,()=>{revision.value++},{deep:true,flush:'sync'})
@@ -114,7 +117,7 @@ const currentFolder=computed(()=>folders.value.find(f=>f.account_id===accountId.
 const selectedFolders=computed(()=>folders.value.filter(f=>f.account_id===selected.value?.account_id&&f.name!==selected.value?.folder&&f.available))
 const archiveFolder=computed(()=>selectedFolders.value.find(f=>f.kind==='archive'))
 const trashFolder=computed(()=>selectedFolders.value.find(f=>f.kind==='trash'))
-const folderLabel=(f:Folder)=>f.kind==='inbox'?t('Inbox','收件箱'):f.kind==='sent'?t('Sent','已发送'):f.kind==='drafts'?t('Server drafts','服务器草稿'):f.kind==='trash'?t('Trash','废纸篓'):f.kind==='junk'?t('Junk','垃圾邮件'):f.kind==='archive'?t('Archive','归档'):f.label
+const folderLabel=(f:Folder)=>f.kind==='local'?t('Imported mail','导入邮件'):f.kind==='inbox'?t('Inbox','收件箱'):f.kind==='sent'?t('Sent','已发送'):f.kind==='drafts'?t('Server drafts','服务器草稿'):f.kind==='trash'?t('Trash','废纸篓'):f.kind==='junk'?t('Junk','垃圾邮件'):f.kind==='archive'?t('Archive','归档'):f.label
 const title=computed(()=>savedSearches.value.find(s=>s.id===activeSavedId.value)?.name||appliedFilters.value.label||(mode.value==='folder'?(currentFolder.value?folderLabel(currentFolder.value):folderName.value):({inbox:t('All inboxes','全部收件箱'),unread:t('Unread inboxes','未读邮件'),starred:t('Starred','星标邮件'),all:t('All cached mail','全部本地邮件'),drafts:t('Local drafts','本地草稿'),outbox:t('Outbox','发件箱')}[mode.value])))
 const searchSeed=computed<SavedSearch>(()=>({id:'',name:'',account_id:['drafts','outbox'].includes(mode.value)?null:accountId.value,mode:['drafts','outbox'].includes(mode.value)?'all':mode.value,folder:folderName.value,query:['drafts','outbox'].includes(mode.value)?'':query.value,filters:['drafts','outbox'].includes(mode.value)?{sender:'',recipient:'',subject:'',label:'',since:null,until:null}:{...appliedFilters.value}}))
 const currentOutbox=computed(()=>outbox.value.filter(o=>!query.value||[o.subject,o.recipients,o.state].some(s=>s.toLowerCase().includes(query.value.toLowerCase()))))
@@ -135,6 +138,10 @@ async function refreshOrganizer(){
 }
 async function organizerChanged(){try{await refreshOrganizer();await load(true,true)}catch(e){error.value=errorText(e)}}
 function openOrganizer(tab:OrganizerTab){if(!busy.value)organizerTab.value=tab}
+async function dataChanged(){try{await refreshAccounts();await refreshOrganizer();await refreshDrafts();await refreshOutbox();await load(true,true)}catch(e){error.value=errorText(e)}}
+async function exportSelected(){const m=selected.value;if(m)await run(async()=>{if(await api.exportEml(m.id))status.value=t('EML exported.','EML 已导出。')})}
+async function exportFolder(){await run(async()=>{const count=await api.exportMbox(accountId.value,mode.value==='folder'?folderName.value:mode.value==='inbox'||mode.value==='unread'?'INBOX':null);if(count!==null)status.value=t('Exported messages: ','已导出邮件：')+count})}
+async function deleteLocal(){const m=selected.value;if(!m||owner(m.account_id)?.auth_kind!=='local')return;if(!confirm(t('Permanently delete this imported local message? This cannot be undone.','永久删除这封本地导入邮件？此操作不可撤销。')))return;await run(async()=>{await api.deleteLocalMail(m.id);await refreshAccounts();await load()})}
 function applyTemplate(){
   const item=templates.value.find(x=>x.id===templateChoice.value);if(!item)return
   if((draft.value.subject||draft.value.body)&&!confirm(t('Replace subject and body with this template? Recipients and attachments are kept.','使用模板替换主题和正文？收件人和附件将保留。')))return
@@ -222,8 +229,8 @@ async function saveAccount(){await run(async()=>{
 })}
 async function testAccount(){const id=accountId.value;if(id)await run(async()=>{status.value=await api.test(id)})}
 async function sync(all=false,automatic=false){await run(async()=>{
-  const active=currentAccount.value,targets=automatic?accounts.value:active?[active]:accounts.value
-  if(!targets.length){if(!automatic)newAccount();return}
+  const active=currentAccount.value,targets=(automatic?sendingAccounts.value:active?[active]:sendingAccounts.value).filter(a=>a.auth_kind!=='local')
+  if(!targets.length){if(!automatic&&active?.auth_kind!=='local')newAccount();return}
   const targetFolder=!automatic&&mode.value==='folder'?folderName.value:null
   let total=0,count=0;const failures:string[]=[]
   for(const a of targets){
@@ -257,7 +264,7 @@ function startCompose(mail:Compose,id:string|null=null){
 }
 function compose(){
   if(busy.value)return
-  if(!accounts.value.length){newAccount();return}
+  if(!sendingAccounts.value.length){newAccount();return}
   const mail=blankCompose(),sig=owner(mail.account_id)?.signature
   if(sig)mail.body='\n\n'+sig
   startCompose(mail)
@@ -362,7 +369,7 @@ function resize(event:PointerEvent,which:'nav'|'list'){
 }
 onMounted(async()=>{
   try{await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();await load();unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})})}catch(e){error.value=errorText(e)}
-  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
+  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&!dataPanel.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
   draftTimer=window.setInterval(()=>{if(autosave.value&&dialog.value==='compose'&&dirty.value&&!busy.value)void run(()=>persistDraft(false))},5000)
 })
 onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.()})
@@ -398,7 +405,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <div class="section accounts-header">{{t('ACCOUNTS','邮箱账号')}}<button @click="newAccount" :title="t('Add account','添加账号')">＋</button></div>
       <div v-for="a in accounts" :key="a.id" class="account-group">
         <div class="account-heading"><button class="expand" @click="toggleExpand(a.id)" :aria-expanded="expanded.includes(a.id)" :aria-label="t('Toggle folders','展开或收起文件夹')">{{expanded.includes(a.id)?'⌄':'›'}}</button>
-          <button class="nav-row account" :class="{active:accountId===a.id&&mode==='folder'&&folderName==='INBOX'}" @click="view(a.id,'folder')"><span class="dot" :style="{background:a.color}"></span><span class="account-text">{{a.name}}<small>{{a.email}}</small></span></button>
+          <button class="nav-row account" :class="{active:accountId===a.id&&mode==='folder'&&folderName===(a.auth_kind==='local'?'Imported':'INBOX')}" @click="view(a.id,'folder',a.auth_kind==='local'?'Imported':'INBOX')"><span class="dot" :style="{background:a.color}"></span><span class="account-text">{{a.auth_kind==='local'?t('Local archive','本地归档'):a.name}}<small>{{a.auth_kind==='local'?t('Offline mail','离线邮件'):a.email}}</small></span></button>
         </div>
         <template v-if="expanded.includes(a.id)">
           <button v-for="f in folders.filter(f=>f.account_id===a.id)" :key="f.name" class="nav-row folder-row" :class="{active:accountId===a.id&&mode==='folder'&&folderName===f.name,unavailable:!f.available}" @click="view(a.id,'folder',f.name)" :title="f.available?f.label:t('Unavailable on server; cached mail retained','服务器文件夹不可用，已保留缓存')"><span class="folder-symbol">{{f.kind==='inbox'?'▤':f.kind==='sent'?'↗':f.kind==='drafts'?'✎':f.kind==='trash'?'♧':f.kind==='archive'?'▣':'▱'}}</span><span class="nav-label">{{folderLabel(f)}}</span><small v-if="f.unread" class="count">{{f.unread}}</small></button>
@@ -406,12 +413,13 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       </div>
       <div v-if="!accounts.length" class="hint">{{t('Add your first mailbox to get started.','添加第一个邮箱以开始使用。')}}</div>
       <button class="add" @click="newAccount">＋ {{t('Add account','添加账号')}}</button>
+      <button class="nav-row" @click="dataPanel=true" :disabled="busy"><span class="folder-symbol">⚙</span><span class="nav-label">{{t('Data management','数据管理')}}</span></button>
       <div class="nav-footer">{{t('Local-first · No Mail EX cloud','本地优先 · 无强制云服务')}}</div>
     </aside>
     <div class="split" role="separator" aria-orientation="vertical" @pointerdown="resize($event,'nav')"></div>
     <section class="message-list">
       <div class="list-head"><h1>{{title}}</h1><div class="toolbar">
-        <template v-if="mode!=='drafts'&&mode!=='outbox'"><button @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button></template>
+        <template v-if="mode!=='drafts'&&mode!=='outbox'"><button v-if="currentAccount?.auth_kind!=='local'" @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'&&currentAccount.auth_kind!=='local'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button><button :disabled="busy" @click="exportFolder">{{t('Export folder / scope (MBOX)','导出文件夹／范围 (MBOX)')}}</button></template>
         <template v-else-if="mode==='outbox'"><button :disabled="busy" @click="run(refreshOutbox)">↻ {{t('Refresh','刷新')}}</button><button @click="compose">{{t('New message','写邮件')}}</button></template>
         <button v-else @click="compose">{{t('New draft','新建草稿')}}</button>
       </div></div>
@@ -450,7 +458,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
           <div class="mail-line"><span class="dot" :style="{background:owner(m.account_id)?.color||'#aaa'}"></span><strong>{{m.sender||t('(Unknown sender)','（未知发件人）')}}</strong><span v-if="m.starred" class="star">★</span><time>{{date(m.timestamp)}}</time></div>
           <div class="subject">{{m.subject||t('(No subject)','（无主题）')}}</div><small>{{owner(m.account_id)?.name}}<template v-if="m.folder!=='INBOX'"> · {{folderOf(m)?.label||m.folder}}</template></small>
         </button></div>
-        <div class="empty" v-if="!messages.length&&!loading"><span>✉</span><p>{{t('No cached messages','没有本地邮件')}}</p><button v-if="accounts.length&&currentFolder?.available!==false" @click="sync()" :disabled="busy">{{t('Sync mail','同步邮件')}}</button></div>
+        <div class="empty" v-if="!messages.length&&!loading"><span>✉</span><p>{{t('No cached messages','没有本地邮件')}}</p><button v-if="sendingAccounts.length&&currentAccount?.auth_kind!=='local'&&currentFolder?.available!==false" @click="sync()" :disabled="busy">{{t('Sync mail','同步邮件')}}</button></div>
         <button v-if="more" class="load-more" @click="load(false)" :disabled="loading">{{t('Load more','加载更多')}}</button>
       </div>
     </section>
@@ -458,7 +466,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
     <section class="reading">
       <template v-if="selected">
         <div class="reader-toolbar">
-          <button @click="reply('reply')" :disabled="busy">{{t('Reply','回复')}}</button><button @click="reply('reply_all')" :disabled="busy">{{t('Reply all','回复全部')}}</button><button @click="reply('forward')" :disabled="busy">{{t('Forward','转发')}}</button>
+          <button @click="reply('reply')" :disabled="busy||!sendingAccounts.length">{{t('Reply','回复')}}</button><button @click="reply('reply_all')" :disabled="busy||!sendingAccounts.length">{{t('Reply all','回复全部')}}</button><button @click="reply('forward')" :disabled="busy||!sendingAccounts.length">{{t('Forward','转发')}}</button><button @click="exportSelected" :disabled="busy">{{t('Export EML','导出 EML')}}</button><button v-if="owner(selected.account_id)?.auth_kind==='local'" class="danger-text" @click="deleteLocal" :disabled="busy">{{t('Delete local mail','删除本地邮件')}}</button>
           <button @click="toggleStar" :disabled="busy">{{selected.starred?t('Unstar','取消星标'):t('Star','星标')}}</button><button @click="toggleSeen" :disabled="busy">{{selected.seen?t('Mark unread','标为未读'):t('Mark read','标为已读')}}</button>
           <button v-if="archiveFolder" @click="moveTo(archiveFolder.name)" :disabled="busy">{{t('Archive','归档')}}</button><button v-if="trashFolder" class="danger-text" @click="moveTo(trashFolder.name)" :disabled="busy">{{t('Move to trash','移至废纸篓')}}</button>
           <div v-if="selectedFolders.length" class="move-control"><select v-model="destination" :disabled="busy" :aria-label="t('Destination folder','目标文件夹')"><option value="">{{t('Choose folder','选择文件夹')}}</option><option v-for="f in selectedFolders" :key="f.name" :value="f.name">{{folderLabel(f)}}</option></select><button @click="moveTo(destination)" :disabled="busy||!destination">{{t('Move','移动')}}</button></div>
@@ -521,7 +529,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <div class="modal-head"><h2>{{draftId?t('Edit draft','编辑草稿'):t('New message','新邮件')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>
 
       <fieldset class="compose-fields" :disabled="busy">
-        <label>{{t('From','发件人')}}<select v-model="draft.account_id" required><option v-for="a in accounts" :key="a.id" :value="a.id">{{a.email}}</option></select></label>
+        <label>{{t('From','发件人')}}<select v-model="draft.account_id" required><option v-for="a in sendingAccounts" :key="a.id" :value="a.id">{{a.email}}</option></select></label>
         <label>{{t('To (comma-separated addresses)','收件人（逗号分隔地址）')}}<RecipientField v-model="draft.to" :contacts="contacts" :zh="zh" required/></label>
         <div class="compose-addresses"><label>Cc<RecipientField v-model="draft.cc" :contacts="contacts" :zh="zh"/></label><label>Bcc<RecipientField v-model="draft.bcc" :contacts="contacts" :zh="zh"/></label></div>
         <label>{{t('Subject','主题')}}<input v-model="draft.subject"></label>
@@ -537,6 +545,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Close','关闭')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{scheduleEnabled?t('Schedule','加入定时队列'):t('Send','发送')}}</button></div>
     </form>
   </div>
+  <DataPanel v-if="dataPanel" :zh="zh" :accounts="accounts" @close="dataPanel=false" @changed="dataChanged"/>
   <OrganizerPanel v-if="organizerTab" :initial-tab="organizerTab" :zh="zh" :accounts="accounts" :search-seed="searchSeed" @close="organizerTab=null" @changed="organizerChanged" @use-search="useSavedSearch"/>
 </div>
 </template>
