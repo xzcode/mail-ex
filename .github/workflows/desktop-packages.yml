@@ -2,6 +2,13 @@ name: Desktop packages
 
 on:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Build target platforms'
+        required: true
+        default: desktop
+        type: choice
+        options: [desktop, all, linux]
 
 permissions:
   contents: read
@@ -11,16 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            bundles: deb
-            artifact: linux-deb
-          - os: windows-latest
-            bundles: nsis
-            artifact: windows-nsis
-          - os: macos-latest
-            bundles: dmg
-            artifact: macos-dmg
+        include: ${{ fromJSON(inputs.platforms == 'linux' && '[{"os":"ubuntu-24.04","bundles":"deb","artifact":"linux-x64"}]' || inputs.platforms == 'all' && '[{"os":"ubuntu-24.04","bundles":"deb","artifact":"linux-x64"},{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"},{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]' || '[{"os":"windows-2025","bundles":"nsis","artifact":"windows-x64"},{"os":"macos-15","bundles":"dmg","artifact":"macos-arm64"},{"os":"macos-15-intel","bundles":"dmg","artifact":"macos-x64"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +27,12 @@ jobs:
           node-version: '22'
           cache: npm
       - name: Rust
-        run: rustup update stable && rustup default stable
+        run: rustup update stable && rustup default stable && rustc --version
       - name: Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config xvfb xauth dbus-x11
       - run: npm ci --no-audit --no-fund
       - run: npm run build
       - run: cargo test --manifest-path core/Cargo.toml --locked
@@ -42,7 +40,18 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 scripts/protocol-fixture.py
       - name: Build desktop installer
+        if: runner.os != 'macOS'
         run: npm run tauri -- build --ci --bundles ${{ matrix.bundles }}
+      - name: Build ad-hoc signed macOS installer
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: |
+          npm run tauri -- build --ci --bundles dmg
+          codesign --verify --deep --strict 'src-tauri/target/release/bundle/macos/Mail EX.app'
+      - name: Linux optimized startup
+        if: runner.os == 'Linux'
+        run: bash scripts/release-smoke.sh src-tauri/target/release/mail-ex
       - name: Verify lockfiles unchanged
         run: git diff --exit-code -- core/Cargo.lock src-tauri/Cargo.lock package-lock.json
       - uses: actions/upload-artifact@v4

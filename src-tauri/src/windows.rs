@@ -61,6 +61,9 @@ pub fn reader_snapshot(window:WebviewWindow,app:AppHandle)->Result<ReaderSnapsho
 pub struct SmokeTargets(pub Mutex<Option<(String,i64)>>);
 #[tauri::command]
 pub fn frontend_ready(window:WebviewWindow,app:AppHandle){
+    // Harmless startup marker for an isolated release-profile smoke test.
+    // No fixture injection or privileged behavior is enabled in release.
+    if window.label()=="main"&&std::env::var_os("MAIL_EX_RELEASE_SMOKE").is_some(){println!("MAIL_EX_RELEASE_FRONTEND_READY main");}
     #[cfg(debug_assertions)]
     if std::env::var_os("MAIL_EX_SMOKE").is_some(){
         println!("MAIL_EX_FRONTEND_READY {}",window.label());
