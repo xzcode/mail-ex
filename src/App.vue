@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment } from './api'
+import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment, type OAuthRequest, type BatchOperation, type SearchFilters } from './api'
 import RichEditor from './components/RichEditor.vue'
 
 type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'
@@ -20,8 +20,74 @@ const readMode=ref<'html'|'plain'>('html'), preview=ref<AttachmentPreview|null>(
 const accountId=ref<string|null>(null), mode=ref<View>('inbox'), folderName=ref('INBOX')
 const query=ref(''), offset=ref(0), more=ref(false), destination=ref('')
 const status=ref(''), error=ref(''), busy=ref(false), loading=ref(false)
-const dialog=ref<'account'|'compose'|null>(null), editId=ref<string|null>(null), draftId=ref<string|null>(null)
+const dialog=ref<'account'|'compose'|'oauth'|null>(null), editId=ref<string|null>(null), draftId=ref<string|null>(null)
 const preset=ref('custom')
+const oauthForm=ref<OAuthRequest>({provider:'google',client_id:'',desktop_client_secret:'',email:'',name:'',color:'#507ed8',account_id:null})
+const oauthWaiting=ref(false),oauthCanceling=ref(false)
+const editingOAuth=computed(()=>!!editId.value&&accounts.value.find(a=>a.id===editId.value)?.auth_kind!=='password')
+const advanced=ref(false)
+const blankFilters=()=>({sender:'',recipient:'',subject:'',fromDate:'',toDate:''})
+const filters=ref(blankFilters()),appliedFilters=ref<SearchFilters>({sender:'',recipient:'',subject:'',since:null,until:null})
+const batchIds=ref<number[]>([]),batchDestination=ref('')
+const selectedRows=computed(()=>messages.value.filter(m=>batchIds.value.includes(m.id)))
+const batchFolders=computed(()=>{
+  const rows=selectedRows.value
+  if(!rows.length||rows.some(m=>m.account_id!==rows[0].account_id))return []
+  return folders.value.filter(f=>f.account_id===rows[0].account_id&&f.available&&!rows.some(m=>m.folder===f.name))
+})
+function localDate(s:string,next=false):number|null{
+  if(!s)return null
+  const [y,m,d]=s.split('-').map(Number)
+  const value=new Date(y,m-1,d+(next?1:0)).getTime()/1000
+  return Number.isFinite(value)?value:null
+}
+function applySearch(){
+  const f=filters.value,since=localDate(f.fromDate),until=localDate(f.toDate,true)
+  if(since!==null&&until!==null&&since>=until){error.value=t('Start date must not be after end date.','开始日期不能晚于结束日期。');return}
+  appliedFilters.value={sender:f.sender,recipient:f.recipient,subject:f.subject,since,until}
+  void load()
+}
+function clearSearch(){query.value='';filters.value=blankFilters();applySearch()}
+function toggleBatch(id:number){batchIds.value=batchIds.value.includes(id)?batchIds.value.filter(v=>v!==id):[...batchIds.value,id];batchDestination.value=''}
+function toggleAllBatch(){batchIds.value=messages.value.length&&messages.value.every(m=>batchIds.value.includes(m.id))?[]:messages.value.map(m=>m.id);batchDestination.value=''}
+async function applyBatch(operation:BatchOperation){
+  const ids=[...batchIds.value];if(!ids.length)return
+  const dest=operation==='move'?batchDestination.value:null
+  if(operation==='move'&&!dest)return
+  if(['move','archive','trash'].includes(operation)&&!confirm(t('Apply this server-side operation to the selected messages?','对所选邮件执行此服务器操作？')))return
+  await run(async()=>{
+    const report=await api.batch(ids,operation,dest)
+    await refreshAccounts();await load(true,true)
+    batchIds.value=report.failed.map(f=>f.id).filter(id=>messages.value.some(m=>m.id===id))
+    status.value=t('Succeeded: ','成功：')+report.succeeded.length+' · '+t('Failed: ','失败：')+report.failed.length
+    if(report.failed.length)error.value=report.failed.map(f=>'#'+f.id+': '+f.reason).join('\n')
+  })
+}
+function startOAuth(account?:Account){
+  if(busy.value)return
+  if(account?.auth_kind==='password')return
+  oauthForm.value={provider:account?.auth_kind||'google',client_id:'',desktop_client_secret:'',email:account?.email||form.value.email,name:account?.name||form.value.name,color:account?.color||form.value.color,account_id:account?.id||null}
+  error.value='';dialog.value='oauth'
+}
+async function authorizeOAuth(){
+  if(oauthWaiting.value)return
+  await run(async()=>{
+    oauthWaiting.value=true;oauthCanceling.value=false
+    status.value=t('Complete authorization in the system browser.','请在系统浏览器完成授权。')
+    try{
+      const result=await api.authorize({...oauthForm.value,client_id:oauthForm.value.client_id.trim(),email:oauthForm.value.email.trim(),desktop_client_secret:oauthForm.value.provider==='google'?oauthForm.value.desktop_client_secret:''})
+      oauthForm.value.desktop_client_secret='';dialog.value=null
+      await refreshAccounts();view(result.id,'folder')
+      status.value=t('OAuth authorization and inbox access verified.','OAuth 授权与收件箱访问已验证。')
+    }finally{oauthWaiting.value=false;oauthCanceling.value=false}
+  })
+}
+async function cancelOAuth(){
+  if(!oauthWaiting.value){closeDialog();return}
+  if(oauthCanceling.value)return
+  oauthCanceling.value=true
+  try{await api.cancelOAuth()}catch(e){error.value=errorText(e);oauthCanceling.value=false}
+}
 const blankAccount=():NewAccount=>({name:'',email:'',username:'',password:'',imap_host:'',imap_port:993,smtp_host:'',smtp_port:465,smtp_starttls:false,color:'#507ed8',signature:''})
 const form=ref<NewAccount>(blankAccount())
 const blankCompose=():Compose=>({account_id:accountId.value||accounts.value[0]?.id||'',to:'',cc:'',bcc:'',subject:'',body:'',html:null,attachments:[],save_sent_copy:false})
@@ -60,12 +126,12 @@ async function refreshDrafts(){drafts.value=await api.drafts()}
 async function load(reset=true,preserve=false){
   const token=++generation
   const previous=preserve?selected.value:null
-  if(reset){offset.value=0;selected.value=null;preview.value=null;detailGeneration++}
+  if(reset){offset.value=0;selected.value=null;preview.value=null;batchIds.value=[];batchDestination.value='';detailGeneration++}
   if(mode.value==='drafts'){messages.value=[];more.value=false;loading.value=false;try{await refreshDrafts()}catch(e){error.value=errorText(e)}return}
   loading.value=true
   try{
     const folder=mode.value==='folder'?folderName.value:mode.value==='inbox'||mode.value==='unread'?'INBOX':null
-    const result=await api.messages(accountId.value,folder,mode.value==='unread',mode.value==='starred',query.value,reset?0:offset.value)
+    const result=await api.messages(accountId.value,folder,mode.value==='unread',mode.value==='starred',query.value,reset?0:offset.value,appliedFilters.value)
     if(token!==generation)return
     messages.value=reset?result:[...messages.value,...result]
     offset.value=messages.value.length;more.value=result.length===100
@@ -79,7 +145,7 @@ async function run(fn:()=>Promise<void>){
   try{await fn()}catch(e){error.value=errorText(e)}finally{busy.value=false}
 }
 function view(id:string|null,kind:View='inbox',folder='INBOX'){
-  accountId.value=id;mode.value=kind;folderName.value=folder;query.value='';void load()
+  accountId.value=id;mode.value=kind;folderName.value=folder;query.value='';filters.value=blankFilters();appliedFilters.value={sender:'',recipient:'',subject:'',since:null,until:null};advanced.value=false;void load()
 }
 function toggleExpand(id:string){
   expanded.value=expanded.value.includes(id)?expanded.value.filter(x=>x!==id):[...expanded.value,id]
@@ -87,7 +153,7 @@ function toggleExpand(id:string){
 function newAccount(){form.value=blankAccount();preset.value='custom';editId.value=null;error.value='';dialog.value='account'}
 function editAccount(){
   const a=currentAccount.value;if(!a)return
-  const {id,...data}=a;editId.value=id;form.value={...data,password:''};preset.value='custom';error.value='';dialog.value='account'
+  const {id,auth_kind:_,...data}=a;editId.value=id;form.value={...data,password:''};preset.value='custom';error.value='';dialog.value='account'
 }
 function applyPreset(){
   const p:Record<string,[string,string,number,boolean]>={qq:['imap.qq.com','smtp.qq.com',465,false],net163:['imap.163.com','smtp.163.com',465,false],net126:['imap.126.com','smtp.126.com',465,false],icloud:['imap.mail.me.com','smtp.mail.me.com',587,true],gmail:['imap.gmail.com','smtp.gmail.com',465,false]}
@@ -97,7 +163,7 @@ function applyPreset(){
 function closeDialog(){
   if(busy.value)return
   if(dialog.value==='compose'&&dirty.value&&!confirm(t('Close without saving the latest changes?','关闭且不保存最近的修改？')))return
-  form.value.password='';dialog.value=null
+  form.value.password='';oauthForm.value.desktop_client_secret='';dialog.value=null
 }
 async function saveAccount(){await run(async()=>{
   const input={...form.value,username:form.value.username.trim()||form.value.email.trim(),name:form.value.name.trim()||form.value.email.trim()}
@@ -243,7 +309,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
 <div class="shell" :data-theme="theme">
   <header class="top">
     <div class="brand"><span class="logo">✉</span> Mail EX</div>
-    <form class="search" @submit.prevent="load()"><input v-model="query" :placeholder="t('Search current view','搜索当前视图')" :aria-label="t('Search','搜索')"><button>{{t('Search','搜索')}}</button></form>
+    <form class="search" @submit.prevent="applySearch"><input v-model="query" :placeholder="t('Search subject, sender, recipient, body','搜索主题、发件人、收件人、正文')" :aria-label="t('Search','搜索')"><button>{{t('Search','搜索')}}</button><button v-if="mode!=='drafts'" type="button" :class="{active:advanced}" @click="advanced=!advanced">{{t('Filters','筛选')}}</button></form>
     <div class="top-actions">
       <select v-model.number="autoMinutes" :aria-label="t('Automatic inbox sync','自动同步收件箱')" :title="t('Automatic inbox sync while open','应用运行时自动同步收件箱')"><option :value="0">{{t('Manual sync','手动同步')}}</option><option :value="1">{{t('Every 1 min','每 1 分钟')}}</option><option :value="5">{{t('Every 5 min','每 5 分钟')}}</option><option :value="15">{{t('Every 15 min','每 15 分钟')}}</option></select>
       <select v-model="theme" :aria-label="t('Theme','主题')"><option value="system">{{t('System','跟随系统')}}</option><option value="light">{{t('Light','浅色')}}</option><option value="dark">{{t('Dark','深色')}}</option></select><button @click="zh=!zh">{{zh?'EN':'中文'}}</button>
@@ -274,19 +340,34 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
     <div class="split" role="separator" aria-orientation="vertical" @pointerdown="resize($event,'nav')"></div>
     <section class="message-list">
       <div class="list-head"><h1>{{title}}</h1><div class="toolbar">
-        <template v-if="mode!=='drafts'"><button @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button></template>
+        <template v-if="mode!=='drafts'"><button @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button></template>
         <button v-else @click="compose">{{t('New draft','新建草稿')}}</button>
       </div></div>
+      <form v-if="advanced&&mode!=='drafts'" class="advanced-search" @submit.prevent="applySearch">
+        <label>{{t('Sender','发件人')}}<input v-model="filters.sender"></label><label>{{t('Recipient','收件人')}}<input v-model="filters.recipient"></label>
+        <label>{{t('Subject','主题')}}<input v-model="filters.subject"></label>
+        <div class="search-dates"><label>{{t('From','开始日期')}}<input v-model="filters.fromDate" type="date"></label><label>{{t('Through','结束日期')}}<input v-model="filters.toDate" type="date"></label></div>
+        <div class="search-filter-actions"><button type="button" @click="clearSearch">{{t('Clear','清除')}}</button><button class="primary">{{t('Apply filters','应用筛选')}}</button></div>
+      </form>
       <div class="list-meta">{{mode==='drafts'?currentDrafts.length:messages.length}} {{t('loaded','封已加载')}} <span v-if="loading">{{t('Loading…','加载中…')}}</span></div>
+      <div v-if="mode!=='drafts'&&messages.length" class="batch-toolbar">
+        <label class="batch-select"><input type="checkbox" :checked="messages.every(m=>batchIds.includes(m.id))" :disabled="busy" @change="toggleAllBatch">{{batchIds.length?t('Selected ','已选 ')+batchIds.length:t('Select loaded','选择已加载')}}</label>
+        <template v-if="batchIds.length">
+          <button :disabled="busy" @click="applyBatch('read')">{{t('Read','已读')}}</button><button :disabled="busy" @click="applyBatch('unread')">{{t('Unread','未读')}}</button>
+          <button :disabled="busy" @click="applyBatch('star')">{{t('Star','星标')}}</button><button :disabled="busy" @click="applyBatch('unstar')">{{t('Unstar','取消星标')}}</button>
+          <button :disabled="busy" @click="applyBatch('archive')">{{t('Archive','归档')}}</button><button class="danger-text" :disabled="busy" @click="applyBatch('trash')">{{t('Trash','废纸篓')}}</button>
+          <div v-if="batchFolders.length" class="batch-move"><select v-model="batchDestination" :disabled="busy" :aria-label="t('Move destination','移动目标')"><option value="">{{t('Choose folder','选择文件夹')}}</option><option v-for="f in batchFolders" :key="f.name" :value="f.name">{{folderLabel(f)}}</option></select><button :disabled="busy||!batchDestination" @click="applyBatch('move')">{{t('Move','移动')}}</button></div>
+        </template>
+      </div>
       <div class="items" v-if="mode==='drafts'">
         <div v-for="d in currentDrafts" :key="d.id" class="draft-row"><button class="mail-row" @click="editDraft(d)" :disabled="busy"><div class="mail-line"><strong>{{d.mail.subject||t('(No subject)','（无主题）')}}</strong><time>{{date(d.updated_at)}}</time></div><div class="subject">{{d.mail.to||t('No recipient','未填写收件人')}}</div><small>{{owner(d.mail.account_id)?.name}}</small></button><button class="delete-draft" @click="deleteDraft(d)" :disabled="busy" :title="t('Delete local draft','删除本地草稿')">×</button></div>
         <div class="empty" v-if="!currentDrafts.length"><span>✎</span><p>{{t('No local drafts','没有本地草稿')}}</p></div>
       </div>
       <div v-else class="items">
-        <button v-for="m in messages" :key="m.id" class="mail-row" :class="{selected:selected?.id===m.id,unseen:!m.seen}" @click="open(m)">
+        <div v-for="m in messages" :key="m.id" class="mail-select-row" :class="{checked:batchIds.includes(m.id)}"><label class="mail-checkbox" :title="t('Select message','选择邮件')"><input type="checkbox" :checked="batchIds.includes(m.id)" :disabled="busy" :aria-label="t('Select message','选择邮件')" @change="toggleBatch(m.id)"></label><button class="mail-row" :class="{selected:selected?.id===m.id,unseen:!m.seen}" @click="open(m)">
           <div class="mail-line"><span class="dot" :style="{background:owner(m.account_id)?.color||'#aaa'}"></span><strong>{{m.sender||t('(Unknown sender)','（未知发件人）')}}</strong><span v-if="m.starred" class="star">★</span><time>{{date(m.timestamp)}}</time></div>
           <div class="subject">{{m.subject||t('(No subject)','（无主题）')}}</div><small>{{owner(m.account_id)?.name}}<template v-if="m.folder!=='INBOX'"> · {{folderOf(m)?.label||m.folder}}</template></small>
-        </button>
+        </button></div>
         <div class="empty" v-if="!messages.length&&!loading"><span>✉</span><p>{{t('No cached messages','没有本地邮件')}}</p><button v-if="accounts.length&&currentFolder?.available!==false" @click="sync()" :disabled="busy">{{t('Sync mail','同步邮件')}}</button></div>
         <button v-if="more" class="load-more" @click="load(false)" :disabled="loading">{{t('Load more','加载更多')}}</button>
       </div>
@@ -324,18 +405,35 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
   <div class="overlay" v-if="dialog" @click.self="closeDialog">
     <form v-if="dialog==='account'" class="modal" @submit.prevent="saveAccount">
       <div class="modal-head"><h2>{{editId?t('Edit mailbox','编辑邮箱'):t('Add mailbox','添加邮箱')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>
+      <button v-if="!editId" type="button" class="oauth-entry" @click="startOAuth()">{{t('Sign in with Google or Microsoft (OAuth 2.0)','使用 Google 或 Microsoft 登录（OAuth 2.0）')}}</button>
       <label v-if="!editId">{{t('Provider','服务商')}}<select v-model="preset" @change="applyPreset"><option value="custom">{{t('Custom IMAP / SMTP','自定义 IMAP / SMTP')}}</option><option value="qq">QQ Mail</option><option value="net163">163 Mail</option><option value="net126">126 Mail</option><option value="icloud">iCloud Mail</option><option value="gmail">Gmail (app password)</option></select></label>
-      <p class="hint">{{editId?t('Leave password blank to keep it. To change the incoming mailbox identity, add a new account.','密码留空则保留原凭据。若需更改收件账号身份，请添加新账号。'):t('Use the provider’s app password or authorization code where required. OAuth is not implemented yet.','按服务商要求使用应用专用密码或授权码。OAuth 尚未实现。')}}</p>
+      <p class="hint">{{editId?t('Leave password blank to keep it. To change the incoming mailbox identity, add a new account.','密码留空则保留原凭据。若需更改收件账号身份，请添加新账号。'):t('Use the provider’s app password or authorization code where required. Google and Microsoft OAuth use the separate sign-in flow.','按服务商要求使用应用专用密码或授权码。Google 和 Microsoft 使用单独的 OAuth 登录入口。')}}</p>
       <label>{{t('Display name','显示名称')}}<input v-model="form.name"></label>
       <label>{{t('Email address','邮箱地址')}}<input v-model="form.email" type="email" required :disabled="!!editId"></label>
       <label>{{t('Login username (optional)','登录名（可选）')}}<input v-model="form.username" autocomplete="off" :disabled="!!editId"></label>
-      <label>{{t('Password / authorization code','密码 / 授权码')}}<input v-model="form.password" type="password" autocomplete="new-password" :required="!editId"></label>
-      <div class="field-grid"><label>IMAP TLS<input v-model="form.imap_host" placeholder="imap.example.com" required :disabled="!!editId"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.imap_port" min="1" max="65535" required :disabled="!!editId"></label><label>SMTP<input v-model="form.smtp_host" placeholder="smtp.example.com" required></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.smtp_port" min="1" max="65535" required></label></div>
-      <label class="inline-label"><input type="checkbox" v-model="form.smtp_starttls"> {{t('SMTP required STARTTLS (otherwise implicit TLS)','SMTP 强制 STARTTLS（否则使用隐式 TLS）')}}</label>
+      <label v-if="!editingOAuth">{{t('Password / authorization code','密码 / 授权码')}}<input v-model="form.password" type="password" autocomplete="new-password" :required="!editId"></label>
+      <div class="field-grid"><label>IMAP TLS<input v-model="form.imap_host" placeholder="imap.example.com" required :disabled="!!editId"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.imap_port" min="1" max="65535" required :disabled="!!editId"></label><label>SMTP<input v-model="form.smtp_host" placeholder="smtp.example.com" required :disabled="editingOAuth"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.smtp_port" min="1" max="65535" required :disabled="editingOAuth"></label></div>
+      <label class="inline-label"><input type="checkbox" v-model="form.smtp_starttls" :disabled="editingOAuth"> {{t('SMTP required STARTTLS (otherwise implicit TLS)','SMTP 强制 STARTTLS（否则使用隐式 TLS）')}}</label>
       <label class="inline-label">{{t('Account color','账号颜色')}} <input type="color" v-model="form.color"></label>
       <label>{{t('Default email signature','默认邮件签名')}}<textarea v-model="form.signature" rows="3" :placeholder="t('Optional plain-text signature','可选纯文本签名')"></textarea></label>
       <div v-if="error" class="error">{{error}}</div>
       <div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Cancel','取消')}}</button><button class="primary" :disabled="busy">{{t('Save account','保存账号')}}</button></div>
+    </form>
+    <form v-else-if="dialog==='oauth'" class="modal" @submit.prevent="authorizeOAuth">
+      <div class="modal-head"><h2>{{oauthForm.account_id?t('Reauthorize mailbox','重新授权邮箱'):t('OAuth mailbox sign-in','OAuth 邮箱登录')}}</h2><button type="button" @click="cancelOAuth" :disabled="oauthCanceling">×</button></div>
+      <p class="hint">{{t('Use your own registered desktop OAuth client. Mail EX opens the official authorization page in your system browser. No mailbox password is collected.','使用你自己的桌面应用 OAuth 注册信息。Mail EX 在系统浏览器打开官方授权页面，不收集邮箱登录密码。')}}</p>
+      <fieldset class="compose-fields" :disabled="oauthWaiting">
+        <label>{{t('Provider','服务商')}}<select v-model="oauthForm.provider" :disabled="!!oauthForm.account_id"><option value="google">Gmail / Google Workspace</option><option value="outlook">Outlook.com / Hotmail</option><option value="microsoft">Microsoft 365 / Exchange Online</option></select></label>
+        <label>{{t('Email address','邮箱地址')}}<input v-model="oauthForm.email" type="email" required :disabled="!!oauthForm.account_id"></label>
+        <label v-if="!oauthForm.account_id">{{t('Display name','显示名称')}}<input v-model="oauthForm.name"></label>
+        <label>OAuth Client ID<input v-model="oauthForm.client_id" required autocomplete="off" spellcheck="false"></label>
+        <label v-if="oauthForm.provider==='google'">{{t('Desktop client secret (if issued)','桌面客户端 Secret（如注册时提供）')}}<input v-model="oauthForm.desktop_client_secret" type="password" autocomplete="off"></label>
+        <p class="hint">{{oauthForm.provider==='google'?t('Register a Desktop app OAuth client and allow the Gmail mail scope. Google may require consent-screen verification.','注册桌面应用 OAuth Client，授权 Gmail 邮件范围；Google 可能要求同意屏幕验证。'):t('Register a Mobile and desktop application / public client with http://localhost redirect and delegated Exchange Online IMAP and SMTP permissions.','注册移动和桌面应用（公共客户端），设置 http://localhost 回调以及 Exchange Online IMAP、SMTP 委托权限。')}}</p>
+        <label v-if="!oauthForm.account_id" class="inline-label">{{t('Account color','账号颜色')}} <input v-model="oauthForm.color" type="color"></label>
+      </fieldset>
+      <div v-if="oauthWaiting" class="notice">{{oauthCanceling?t('Canceling authorization…','正在取消授权…'):t('Waiting for authorization in the system browser…','等待系统浏览器授权…')}}</div>
+      <div v-if="error" class="error">{{error}}</div>
+      <div class="modal-actions"><button type="button" @click="cancelOAuth" :disabled="oauthCanceling">{{t('Cancel','取消')}}</button><button class="primary" :disabled="busy">{{t('Authorize in browser','在浏览器授权')}}</button></div>
     </form>
     <form v-else class="modal compose-modal" @submit.prevent="send">
       <div class="modal-head"><h2>{{draftId?t('Edit draft','编辑草稿'):t('New message','新邮件')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>

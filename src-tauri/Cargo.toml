@@ -12,3 +12,5 @@ mail-ex-core = { path = "../core" }
 anyhow = "1"
 
 tauri-plugin-dialog = "2"
+
+open = "5"

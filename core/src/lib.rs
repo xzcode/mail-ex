@@ -8,13 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs::{self, OpenOptions}, io::Write, net::{TcpStream, ToSocketAddrs}, path::Path, time::Duration};
 use uuid::Uuid;
 mod mime;
+mod oauth;
+pub use oauth::OAuthRequest;
 pub use mime::{AttachmentInfo, AttachmentPreview, OutgoingAttachment};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: String, pub name: String, pub email: String, pub username: String,
     pub imap_host: String, pub imap_port: u16, pub smtp_host: String, pub smtp_port: u16,
-    pub smtp_starttls: bool, pub color: String, pub signature: String,
+    pub smtp_starttls: bool, pub color: String, pub signature: String, pub auth_kind: String,
 }
 #[derive(Deserialize)]
 pub struct NewAccount {
@@ -53,14 +55,21 @@ pub struct Draft {
 pub struct SyncReport { pub added: usize, pub folders: usize }
 #[derive(Serialize)]
 pub struct SendReport { pub sent_copy: String }
-const ACCOUNT_COLUMNS: &str = "id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,signature";
+const ACCOUNT_COLUMNS: &str = "id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,signature,auth_kind";
+#[derive(Default,Clone,Deserialize)]
+#[serde(default)]
+pub struct SearchFilters { pub sender:String, pub recipient:String, pub subject:String, pub since:Option<i64>,pub until:Option<i64> }
+#[derive(Serialize)]
+pub struct BatchFailure{pub id:i64,pub reason:String}
+#[derive(Default,Serialize)]
+pub struct BatchReport{pub succeeded:Vec<i64>,pub failed:Vec<BatchFailure>}
 const SUMMARY_COLUMNS: &str = "id,account_id,sender,subject,timestamp,seen,folder,starred";
 const TIMEOUT: Duration = Duration::from_secs(45);
 type ImapSession = imap::Session<TlsStream<TcpStream>>;
 
 fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id:r.get(0)?, name:r.get(1)?, email:r.get(2)?, username:r.get(3)?,
-        imap_host:r.get(4)?, imap_port:r.get(5)?, smtp_host:r.get(6)?, smtp_port:r.get(7)?, smtp_starttls:r.get(8)?, color:r.get(9)?, signature:r.get(10)? })
+        imap_host:r.get(4)?, imap_port:r.get(5)?, smtp_host:r.get(6)?, smtp_port:r.get(7)?, smtp_starttls:r.get(8)?, color:r.get(9)?, signature:r.get(10)?, auth_kind:r.get(11)? })
 }
 fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
     Ok(Summary { id:r.get(0)?, account_id:r.get(1)?, sender:r.get(2)?, subject:r.get(3)?, timestamp:r.get(4)?, seen:r.get(5)?, folder:r.get(6)?, starred:r.get(7)? })
@@ -104,11 +113,11 @@ impl Store {
         db.busy_timeout(Duration::from_secs(15))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let initial_version:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if initial_version>3 { bail!("Database belongs to a newer Mail EX version") }
-        if initial_version<3 {
+        if initial_version>5 { bail!("Database belongs to a newer Mail EX version") }
+        if initial_version<5 {
         let migration=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version:i64=migration.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version>3 { bail!("Database belongs to a newer Mail EX version") }
+        if version>5 { bail!("Database belongs to a newer Mail EX version") }
         if version==0 {
             migration.execute_batch("CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL, imap_port INTEGER NOT NULL, smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL, smtp_starttls INTEGER NOT NULL, color TEXT NOT NULL, secret BLOB NOT NULL);
               CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, folder TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, timestamp INTEGER NOT NULL, seen INTEGER NOT NULL, body TEXT NOT NULL, html_only INTEGER NOT NULL, raw BLOB NOT NULL, UNIQUE(account_id,folder,uid_validity,uid));
@@ -132,6 +141,33 @@ impl Store {
               ALTER TABLE drafts ADD COLUMN save_sent_copy INTEGER NOT NULL DEFAULT 0;
               PRAGMA user_version=3;")?;
         }
+        if version<4 {
+            migration.execute_batch("ALTER TABLE accounts ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'password'; PRAGMA user_version=4;")?;
+        }
+        if version<5 {
+            migration.execute_batch("CREATE VIRTUAL TABLE message_search USING fts5(subject,sender,recipients,body,content='messages',content_rowid='id',tokenize='trigram');
+              INSERT INTO message_search(message_search) VALUES('rebuild');
+              CREATE TRIGGER message_search_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO message_search(rowid,subject,sender,recipients,body) VALUES(new.id,new.subject,new.sender,new.recipients,new.body);
+              END;
+              CREATE TRIGGER message_search_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO message_search(message_search,rowid,subject,sender,recipients,body) VALUES('delete',old.id,old.subject,old.sender,old.recipients,old.body);
+              END;
+              CREATE TRIGGER message_search_update AFTER UPDATE OF subject,sender,recipients,body ON messages BEGIN
+                INSERT INTO message_search(message_search,rowid,subject,sender,recipients,body) VALUES('delete',old.id,old.subject,old.sender,old.recipients,old.body);
+                INSERT INTO message_search(rowid,subject,sender,recipients,body) VALUES(new.id,new.subject,new.sender,new.recipients,new.body);
+              END;
+              PRAGMA user_version=5;")?;
+            // Index text fallback for already-cached HTML-only messages.
+            let updates={
+                let mut q=migration.prepare("SELECT id,raw FROM messages WHERE html_only=1 AND body=''")?;
+                let rows=q.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
+                let mut updates=Vec::new();
+                for row in rows {let (id,raw)=row?;if let Ok(mail)=mailparse::parse_mail(&raw){if let Some(html)=mime::body_part(&mail,"text/html"){updates.push((id,mime::plain_from_html(&html)))}}}
+                updates
+            };
+            for (id,body) in updates{migration.execute("UPDATE messages SET body=? WHERE id=?",params![body,id])?;}
+        }
         migration.commit()?;
         }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(dir.join("mail.sqlite3"),fs::Permissions::from_mode(0o600))?; }
@@ -152,6 +188,60 @@ impl Store {
         let bytes:Vec<u8>=self.db.query_row("SELECT secret FROM accounts WHERE id=?",[id],|r|r.get(0))?;
         decrypt(&self.key,id,&bytes)
     }
+    fn credential(&self,a:&Account)->Result<String>{
+        if a.auth_kind=="password"{return self.password(&a.id)}
+        let provider=oauth::Provider::parse(&a.auth_kind)?;
+        let (imap,smtp,port,starttls)=provider.servers();
+        if a.imap_host!=imap||a.imap_port!=993||a.smtp_host!=smtp||a.smtp_port!=port||a.smtp_starttls!=starttls||a.username!=a.email{bail!("OAuth account endpoint does not match its provider")}
+        // Serialize refreshes across store connections in the current process.
+        static REFRESH:std::sync::Mutex<()>=std::sync::Mutex::new(());
+        let _guard=REFRESH.lock().map_err(|_|anyhow!("OAuth refresh lock unavailable"))?;
+        let current:Vec<u8>=self.db.query_row("SELECT secret FROM accounts WHERE id=? AND auth_kind=?",params![a.id,a.auth_kind],|r|r.get(0))?;
+        let secret=decrypt(&self.key,&a.id,&current)?;
+        let mut tokens:oauth::Tokens=serde_json::from_str(&secret).map_err(|_|anyhow!("OAuth credential is invalid; reauthorize the account"))?;
+        if tokens.expiring(){
+            oauth::refresh(provider,&mut tokens)?;
+            let updated=encrypt(&self.key,&a.id,&serde_json::to_string(&tokens)?)?;
+            let changed=self.db.execute("UPDATE accounts SET secret=? WHERE id=? AND auth_kind=? AND secret=?",params![updated,a.id,a.auth_kind,current])?;
+            if changed!=1{bail!("OAuth account changed during refresh; try again")}
+        }
+        Ok(tokens.access_token)
+    }
+    pub fn authorize_account(&mut self,request:OAuthRequest,cancel:&std::sync::atomic::AtomicBool,open_browser:impl FnOnce(&str)->Result<()>)->Result<Account>{
+        let provider=oauth::Provider::parse(&request.provider)?;
+        let email=request.email.trim().to_owned();
+        let _:Mailbox=email.parse().map_err(|_|anyhow!("Invalid email address"))?;
+        if email.chars().any(char::is_control){bail!("Invalid email address")}
+        let (imap_host,smtp_host,smtp_port,smtp_starttls)=provider.servers();
+        let existing=match &request.account_id{
+            Some(id)=>{
+                let a=self.account(id)?;
+                if a.auth_kind!=provider.id()||a.email!=email{bail!("Reauthorization must use the same provider and mailbox")}
+                Some(a)
+            },None=>None
+        };
+        let tokens=oauth::authorize(&request,cancel,open_browser)?;
+        let a=existing.unwrap_or_else(||Account{
+            id:Uuid::new_v4().to_string(),name:if request.name.trim().is_empty(){email.clone()}else{request.name.trim().to_owned()},
+            email:email.clone(),username:email.clone(),imap_host:imap_host.into(),imap_port:993,
+            smtp_host:smtp_host.into(),smtp_port,smtp_starttls,color:if request.color.is_empty(){"#507ed8".into()}else{request.color.clone()},signature:String::new(),auth_kind:provider.id().into()
+        });
+        // Verify mailbox access before replacing existing credentials or creating an account.
+        let mut session=connect_imap(&a,&tokens.access_token)?;
+        session.examine("INBOX").context("OAuth authorized but IMAP inbox is not accessible")?;
+        let _=session.logout();
+        if cancel.load(std::sync::atomic::Ordering::Relaxed){bail!("OAuth authorization canceled")}
+        let secret=encrypt(&self.key,&a.id,&serde_json::to_string(&tokens)?)?;
+        let tx=self.db.transaction()?;
+        if request.account_id.is_some(){
+            let changed=tx.execute("UPDATE accounts SET secret=? WHERE id=? AND auth_kind=?",params![secret,a.id,a.auth_kind])?;
+            if changed!=1{bail!("Account was removed during authorization")}
+        }else{
+            tx.execute("INSERT INTO accounts(id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,secret,signature,auth_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.name,a.email,a.username,a.imap_host,a.imap_port,a.smtp_host,a.smtp_port,a.smtp_starttls,a.color,secret,a.signature,a.auth_kind])?;
+            tx.execute("INSERT INTO folders(account_id,name,label,kind) VALUES(?,'INBOX','INBOX','inbox')",[&a.id])?;
+        }
+        tx.commit()?;Ok(a)
+    }
     pub fn add_account(&self,input:NewAccount)->Result<Account>{
         let email=input.email.trim().to_string();
         let _:Mailbox=email.parse().map_err(|_|anyhow!("Invalid email address"))?;
@@ -160,7 +250,7 @@ impl Store {
         if input.username.contains(['\r','\n'])||input.password.contains(['\r','\n']) {bail!("Invalid credential characters")}
         let name=if input.name.trim().is_empty(){email.clone()}else{input.name.trim().to_string()};
         let username=if input.username.trim().is_empty(){email.clone()}else{input.username.trim().to_string()};
-        let a=Account{id:Uuid::new_v4().to_string(),name,email,username,imap_host:input.imap_host,imap_port:input.imap_port,smtp_host:input.smtp_host,smtp_port:input.smtp_port,smtp_starttls:input.smtp_starttls,color:input.color,signature:input.signature};
+        let a=Account{id:Uuid::new_v4().to_string(),name,email,username,imap_host:input.imap_host,imap_port:input.imap_port,smtp_host:input.smtp_host,smtp_port:input.smtp_port,smtp_starttls:input.smtp_starttls,color:input.color,signature:input.signature,auth_kind:"password".into()};
         let secret=encrypt(&self.key,&a.id,&input.password)?;
         self.db.execute("INSERT INTO accounts(id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,secret,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.name,a.email,a.username,a.imap_host,a.imap_port,a.smtp_host,a.smtp_port,a.smtp_starttls,a.color,secret,a.signature])?;
         self.db.execute("INSERT OR IGNORE INTO folders(account_id,name,label,kind) VALUES(?,'INBOX','INBOX','inbox')",[&a.id])?;
@@ -176,6 +266,9 @@ impl Store {
         if !valid_host(&input.smtp_host)||input.smtp_port==0 {bail!("Invalid SMTP host or port")}
         if input.password.contains(['\r','\n']) {bail!("Invalid credential characters")}
         let name=if input.name.trim().is_empty(){old.email.clone()}else{input.name.trim().to_string()};
+        if old.auth_kind!="password" && (!input.password.is_empty()||input.smtp_host!=old.smtp_host||input.smtp_port!=old.smtp_port||input.smtp_starttls!=old.smtp_starttls){
+            bail!("OAuth credentials and server endpoints cannot be changed here; use Reauthorize")
+        }
         let secret=if input.password.is_empty(){None}else{Some(encrypt(&self.key,id,&input.password)?)};
         self.db.execute("UPDATE accounts SET name=?,smtp_host=?,smtp_port=?,smtp_starttls=?,color=?,secret=coalesce(?,secret),signature=? WHERE id=?",params![name,input.smtp_host,input.smtp_port,input.smtp_starttls,input.color,secret,input.signature,id])?;
         self.account(id)
@@ -187,7 +280,7 @@ impl Store {
     }
     pub fn remove_account(&self,id:&str)->Result<()>{self.db.execute("DELETE FROM accounts WHERE id=?",[id])?;Ok(())}
     pub fn test_account(&self,id:&str)->Result<String>{
-        let a=self.account(id)?;let pw=self.password(id)?;
+        let a=self.account(id)?;let pw=self.credential(&a)?;
         let mut session=connect_imap(&a,&pw)?;
         session.examine("INBOX").context("Cannot access INBOX")?;
         let _=session.logout();
@@ -196,7 +289,7 @@ impl Store {
         Ok("IMAP and SMTP connection checks succeeded.".into())
     }
     pub fn sync_account(&mut self,id:&str,folder:Option<String>,all_folders:bool)->Result<SyncReport>{
-        let a=self.account(id)?;let pw=self.password(id)?;
+        let a=self.account(id)?;let pw=self.credential(&a)?;
         let mut session=connect_imap(&a,&pw)?;
         let listed=discover(&mut session)?;
         {
@@ -257,10 +350,47 @@ impl Store {
         Ok(added)
     }
     pub fn messages(&self,account_id:Option<String>,folder:Option<String>,unread:bool,starred:bool,query:&str,offset:u32)->Result<Vec<Summary>>{
-        let sql=format!("SELECT {SUMMARY_COLUMNS} FROM messages WHERE (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR folder=?2) AND (NOT ?3 OR seen=0) AND (NOT ?4 OR starred=1) AND (?5='' OR instr(lower(subject),lower(?5))>0 OR instr(lower(sender),lower(?5))>0 OR instr(lower(body),lower(?5))>0) ORDER BY timestamp DESC,id DESC LIMIT 100 OFFSET ?6");
-        let mut s=self.db.prepare(&sql)?;
-        let result=s.query_map(params![account_id,folder,unread,starred,query,offset],summary_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        self.search_messages(account_id,folder,unread,starred,query,offset,SearchFilters::default())
+    }
+    pub fn search_messages(&self,account_id:Option<String>,folder:Option<String>,unread:bool,starred:bool,query:&str,offset:u32,filters:SearchFilters)->Result<Vec<Summary>>{
+        let query=query.trim();
+        // A quoted FTS phrase treats user input literally, including FTS operators.
+        // Trigram supports substring searches in languages without word boundaries.
+        let indexed=query.chars().count()>=3&&!query.contains('\0');
+        let phrase=format!("\"{}\"",query.replace('"',"\"\""));
+        let fulltext=if indexed{" AND id IN (SELECT rowid FROM message_search WHERE message_search MATCH ?5)"}else{" AND (?5='' OR instr(lower(subject),lower(?5))>0 OR instr(lower(sender),lower(?5))>0 OR instr(lower(recipients),lower(?5))>0 OR instr(lower(body),lower(?5))>0)"};
+        let sql=format!("SELECT {SUMMARY_COLUMNS} FROM messages WHERE (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR folder=?2) AND (NOT ?3 OR seen=0) AND (NOT ?4 OR starred=1){fulltext} AND (?7='' OR instr(lower(sender),lower(?7))>0) AND (?8='' OR instr(lower(recipients),lower(?8))>0) AND (?9='' OR instr(lower(subject),lower(?9))>0) AND (?10 IS NULL OR timestamp>=?10) AND (?11 IS NULL OR timestamp<?11) ORDER BY timestamp DESC,id DESC LIMIT 100 OFFSET ?6");
+        let mut q=self.db.prepare(&sql)?;
+        let result=q.query_map(params![account_id,folder,unread,starred,if indexed{phrase.as_str()}else{query},offset,filters.sender.trim(),filters.recipient.trim(),filters.subject.trim(),filters.since,filters.until],summary_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(result)
+    }
+    pub fn batch(&self,ids:Vec<i64>,operation:&str,destination:Option<String>)->Result<BatchReport>{
+        if !["read","unread","star","unstar","move","archive","trash"].contains(&operation){bail!("Unsupported batch operation")}
+        let mut report=BatchReport::default();
+        let mut seen=HashSet::new();
+        for id in ids{
+            if !seen.insert(id){continue}
+            let result=(||->Result<()>{
+                match operation{
+                    "read"=>self.set_seen(id,true),"unread"=>self.set_seen(id,false),
+                    "star"=>self.set_starred(id,true),"unstar"=>self.set_starred(id,false),
+                    "move"=>{
+                        let dest=destination.as_deref().ok_or_else(||anyhow!("Choose a destination folder"))?;
+                        self.move_message(id,dest)
+                    },
+                    "archive"|"trash"=>{
+                        let (account,folder,_,_)=self.message_location(id)?;
+                        let mut q=self.db.prepare("SELECT name FROM folders WHERE account_id=? AND kind=? AND available=1 AND name<>?")?;
+                        let rows=q.query_map(params![account,operation,folder],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                        if rows.len()!=1{bail!("No unambiguous server-declared destination folder")}
+                        self.move_message(id,&rows[0])
+                    },
+                    _=>unreachable!()
+                }
+            })();
+            match result{Ok(())=>report.succeeded.push(id),Err(e)=>report.failed.push(BatchFailure{id,reason:e.to_string()})}
+        }
+        Ok(report)
     }
     pub fn message(&self,id:i64)->Result<Mail>{
         let (summary,mut body,html_only,recipients,raw):(Summary,String,bool,String,Vec<u8>)=self.db.query_row(&format!("SELECT {SUMMARY_COLUMNS},body,html_only,recipients,raw FROM messages WHERE id=?"),[id],|r|Ok((summary_row(r)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)))?;
@@ -294,7 +424,7 @@ impl Store {
     pub fn set_starred(&self,id:i64,starred:bool)->Result<()>{self.set_flag(id,"starred",starred)}
     fn set_flag(&self,id:i64,flag:&str,value:bool)->Result<()>{
         let (aid,folder,validity,uid)=self.message_location(id)?;
-        let a=self.account(&aid)?;let pw=self.password(&aid)?;
+        let a=self.account(&aid)?;let pw=self.credential(&a)?;
         let mut session=connect_imap(&a,&pw)?;
         let mailbox=session.select(&folder).context("Cannot select mailbox")?;
         if mailbox.uid_validity!=Some(validity){bail!("Mailbox identity changed; sync before updating")}
@@ -312,7 +442,7 @@ impl Store {
         if folder==destination {bail!("Source and destination folders are identical")}
         let available:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=? AND name=? AND available=1)",params![aid,destination],|r|r.get(0))?;
         if !available{bail!("Destination is not an available folder of this account")}
-        let a=self.account(&aid)?;let pw=self.password(&aid)?;
+        let a=self.account(&aid)?;let pw=self.credential(&a)?;
         let mut session=connect_imap(&a,&pw)?;
         let caps=session.capabilities().context("Cannot check IMAP capabilities")?;
         if !caps.has_str("MOVE"){bail!("Server does not support UID MOVE; no message was changed")}
@@ -379,7 +509,7 @@ impl Store {
         Ok(Compose{account_id:account.id,to,cc,bcc:String::new(),subject,body:quoted,in_reply_to:message_id,references,html:None,attachments,save_sent_copy:false})
     }
     pub fn send(&self,mail:Compose)->Result<SendReport>{
-        let a=self.account(&mail.account_id)?;let pw=self.password(&a.id)?;
+        let a=self.account(&mail.account_id)?;let pw=self.credential(&a)?;
         let mut builder=Message::builder().from(a.email.parse().map_err(|_|anyhow!("Invalid sender address"))?).subject(mail.subject);
         let recipients=addresses(&mail.to)?;
         if recipients.is_empty(){bail!("At least one recipient is required")}
@@ -476,11 +606,17 @@ fn connect_imap(a:&Account,pw:&str)->Result<ImapSession>{
     let tls=TlsConnector::new()?.connect(&a.imap_host,stream).map_err(|_|anyhow!("IMAP TLS handshake or certificate validation failed"))?;
     let mut client=imap::Client::new(tls);
     client.read_greeting().context("IMAP server greeting failed")?;
-    client.login(&a.username,pw).map_err(|_|anyhow!("IMAP authentication failed; check provider authorization requirements"))
+    if a.auth_kind=="password"{
+        client.login(&a.username,pw).map_err(|_|anyhow!("IMAP authentication failed; check provider authorization requirements"))
+    }else{
+        client.authenticate("XOAUTH2",&oauth::Xoauth2::new(&a.username,pw)).map_err(|_|anyhow!("IMAP OAuth authentication failed; check provider policy or reauthorize"))
+    }
 }
 fn smtp(a:&Account,pw:&str)->Result<SmtpTransport>{
     let builder=if a.smtp_starttls{SmtpTransport::starttls_relay(&a.smtp_host)?}else{SmtpTransport::relay(&a.smtp_host)?};
-    Ok(builder.port(a.smtp_port).timeout(Some(TIMEOUT)).credentials(Credentials::new(a.username.clone(),pw.to_owned())).build())
+    let builder=builder.port(a.smtp_port).timeout(Some(TIMEOUT)).credentials(Credentials::new(a.username.clone(),pw.to_owned()));
+    let builder=if a.auth_kind=="password"{builder}else{builder.authentication(vec![lettre::transport::smtp::authentication::Mechanism::Xoauth2])};
+    Ok(builder.build())
 }
 #[derive(Default)]
 struct Parsed { sender:String,recipients:String,subject:String,timestamp:i64,body:String,html_only:bool }
@@ -488,8 +624,8 @@ fn text_part(mail:&ParsedMail<'_>)->Option<String>{mime::body_part(mail,"text/pl
 fn has_html(mail:&ParsedMail<'_>)->bool{mime::body_part(mail,"text/html").is_some()}
 fn parse(raw:&[u8])->Parsed{
     let Ok(mail)=mailparse::parse_mail(raw)else{return Parsed{body:"Unable to decode this message. Original MIME cached.".into(),..Default::default()}};
-    let headers=mail.get_headers();let body=text_part(&mail);
-    Parsed{sender:headers.get_first_value("From").unwrap_or_default(),recipients:headers.get_first_value("To").unwrap_or_default(),subject:headers.get_first_value("Subject").unwrap_or_default(),timestamp:headers.get_first_value("Date").and_then(|s|mailparse::dateparse(&s).ok()).unwrap_or(0),html_only:body.is_none()&&has_html(&mail),body:body.unwrap_or_default()}
+    let headers=mail.get_headers();let body=text_part(&mail);let html_only=body.is_none()&&has_html(&mail);let body=body.or_else(||mime::body_part(&mail,"text/html").map(|h|mime::plain_from_html(&h)));
+    Parsed{sender:headers.get_first_value("From").unwrap_or_default(),recipients:headers.get_first_value("To").unwrap_or_default(),subject:headers.get_first_value("Subject").unwrap_or_default(),timestamp:headers.get_first_value("Date").and_then(|s|mailparse::dateparse(&s).ok()).unwrap_or(0),html_only,body:body.unwrap_or_default()}
 }
 
 #[cfg(test)]
@@ -526,6 +662,23 @@ mod tests{
         db.delete_draft(&id).unwrap();assert!(db.drafts().unwrap().is_empty());
         assert_eq!(decode_mailbox("&ZeVnLIqe-"),"日本語");
         assert_eq!(decode_mailbox("A&-B"),"A&B");
+    }
+    #[test] fn indexed_search_and_filters(){
+        let dir=tempfile::tempdir().unwrap();let db=Store::open(dir.path()).unwrap();let a=db.add_account(input()).unwrap();
+        for (uid,subject,sender,body) in [(1,"Quarterly report","Alice","项目开发进度"),(2,"Another subject","Bob","report body")]{
+            db.db.execute("INSERT INTO messages(account_id,folder,uid_validity,uid,sender,recipients,subject,timestamp,seen,body,html_only,raw,starred) VALUES(?,'INBOX',1,?,?,'team@example.invalid',?,100,0,?,0,X'00',0)",params![a.id,uid,sender,subject,body]).unwrap();
+        }
+        assert_eq!(db.messages(None,None,false,false,"report",0).unwrap().len(),2);
+        assert_eq!(db.messages(None,None,false,false,"开发进",0).unwrap().len(),1);
+        assert_eq!(db.messages(None,None,false,false,"项目",0).unwrap().len(),1);
+        assert_eq!(db.messages(None,None,false,false,"report OR Bob",0).unwrap().len(),0);
+        let results=db.search_messages(None,None,false,false,"report",0,SearchFilters{sender:"alice".into(),since:Some(99),until:Some(101),..Default::default()}).unwrap();
+        assert_eq!(results.len(),1);
+        db.db.execute("UPDATE messages SET body='updated text' WHERE id=?",[results[0].id]).unwrap();
+        assert!(db.messages(None,None,false,false,"开发进",0).unwrap().is_empty());
+        assert_eq!(db.messages(None,None,false,false,"updated",0).unwrap().len(),1);
+        db.remove_account(&a.id).unwrap();
+        assert!(db.messages(None,None,false,false,"report",0).unwrap().is_empty());
     }
     #[test] fn mime_text_and_html(){
         let m=parse(b"From: Alice <a@example.org>\r\nTo: b@example.org\r\nSubject: Hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nWorld");
