@@ -21,3 +21,10 @@ Native Tauri desktop build/runtime (GTK/WebKitGTK dependencies not present on th
 - `bdc93cfa9800e472612360f3c6398cd7bf607f75`: extended `python3 scripts/protocol-fixture.py` passed (1 integration test, 2.18 s). Inbound safe HTML, text attachment metadata/preview/exact bytes, forwarded attachment, saved draft reopen, rich multipart SMTP, exact binary payload (including NUL/0xff/line endings), opt-in Sent APPEND, sent-folder sync and absence of Bcc headers in SMTP and stored MIME all verified. Fixture tolerates MIME boundary whitespace in HTML.
 - Updated core Cargo.lock with ammonia 4.2.5, html-escape 0.2.15 and serde_json 1.0.154 resolved on the build host.
 - Native Tauri compilation/runtime, native save dialog and interactive editor behavior have not been tested; GTK/WebKitGTK environment still missing. No actual provider or external message used. No Release. Old imap-proto future-incompatibility warning remains.
+
+## M4 OAuth / M5 indexed search and batch — 2026-11-27
+
+- `bb50514fb8402d3b7c303b4228cfb04c50cf5a88`: Guangzhou Linux checkout, `npm run build` passed (vue-tsc and Vite 6.4.6; 16 modules, JS 120.23 kB, CSS 12.81 kB).
+- Tokyo Linux, Rust 1.100.0 with isolated matching OpenSSL development headers: core compilation and 10 unit tests passed. New cases verify PKCE/state, OAuth callback/cancel, token rotation/SASL construction, FTS5 index and filters. The pre-existing TLS integration fixture also passed.
+- `7458e008ce501c26a2bc5769ff7a9170ae95a70c`: updated Cargo.lock committed. `cargo test --manifest-path core/Cargo.toml --offline --locked -j 2`: 10/10 unit tests passed. `python3 scripts/protocol-fixture.py`: 1/1 expanded integration test passed (3.44 s), including duplicate ID handling, mixed success/failure, batch archive, read/unread/star across folders and indexed trash search.
+- OAuth unit tests do not establish live Google/Microsoft compatibility. No registered project client IDs, real consent, production access/refresh token exchange or real account were used. Native Tauri desktop authorization/browser launch and runtime remain unverified. Existing imap-proto future-incompatibility warning persists. No release.
