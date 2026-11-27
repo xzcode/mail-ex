@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport,Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem,ImportReport,StorageStats,CacheReport,SnapshotReport};
+use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport,Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem,ImportReport,StorageStats,CacheReport,SnapshotReport,CalendarEvent,CalendarSource,NewCalendarSource,Invitation,CalendarSyncReport};
 use tauri::{AppHandle,Manager,Emitter};
 use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
 static OAUTH:Mutex<Option<Arc<AtomicBool>>>=Mutex::new(None);
 struct OAuthGuard;
 impl Drop for OAuthGuard {fn drop(&mut self){if let Ok(mut active)=OAUTH.lock(){*active=None;}}}
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_notification::NotificationExt;
 use std::path::{Path,PathBuf};
 use std::fs;
 use std::io::Write;
@@ -61,7 +62,16 @@ async fn list_folders(app:AppHandle)->Result<Vec<Folder>,String>{work(app,|s|s.f
 #[tauri::command]
 async fn test_account(app:AppHandle,id:String)->Result<String,String>{work(app,move|s|s.test_account(&id)).await}
 #[tauri::command]
-async fn sync_account(app:AppHandle,id:String,folder:Option<String>,all_folders:bool)->Result<SyncReport,String>{work(app,move|s|s.sync_account(&id,folder,all_folders)).await}
+async fn sync_account(app:AppHandle,id:String,folder:Option<String>,all_folders:bool)->Result<SyncReport,String>{
+    let handle=app.clone();
+    work(app,move|s|{
+        let result=s.sync_account(&id,folder,all_folders)?;
+        if result.added>0&&s.notification_enabled().unwrap_or(false){
+            let _=handle.notification().builder().title("Mail EX").body(format!("{} newly synchronized messages",result.added)).show();
+        }
+        Ok(result)
+    }).await
+}
 #[tauri::command]
 async fn list_messages(app:AppHandle,account_id:Option<String>,folder:Option<String>,unread:bool,starred:bool,query:String,offset:u32,filters:SearchFilters)->Result<Vec<Summary>,String>{work(app,move|s|s.search_messages(account_id,folder,unread,starred,&query,offset,filters)).await}
 #[tauri::command]
@@ -233,14 +243,76 @@ async fn copy_storage(app:AppHandle)->Result<Option<SnapshotReport>,String>{
     }).await
 }
 
+
+#[tauri::command]
+async fn add_pop_account(app:AppHandle,account:NewAccount)->Result<Account,String>{work(app,move|s|s.add_pop_account(account)).await}
+#[tauri::command]
+async fn list_calendar_events(app:AppHandle)->Result<Vec<CalendarEvent>,String>{work(app,|s|s.calendar_events()).await}
+#[tauri::command]
+async fn save_calendar_event(app:AppHandle,event:CalendarEvent)->Result<CalendarEvent,String>{work(app,move|s|s.save_calendar_event(event)).await}
+#[tauri::command]
+async fn delete_calendar_event(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_calendar_event(&id)).await}
+#[tauri::command]
+async fn list_calendar_sources(app:AppHandle)->Result<Vec<CalendarSource>,String>{work(app,|s|s.calendar_sources()).await}
+#[tauri::command]
+async fn add_calendar_source(app:AppHandle,source:NewCalendarSource)->Result<CalendarSource,String>{work(app,move|s|s.add_calendar_source(source)).await}
+#[tauri::command]
+async fn remove_calendar_source(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.remove_calendar_source(&id)).await}
+#[tauri::command]
+async fn sync_calendar(app:AppHandle,id:String)->Result<CalendarSyncReport,String>{work(app,move|s|s.sync_calendar(&id)).await}
+#[tauri::command]
+async fn import_calendar_ics(app:AppHandle)->Result<Option<ImportReport>,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().add_filter("iCalendar",&["ics"]).blocking_pick_file()else{return Ok(None)};Ok(Some(s.import_calendar_file(&picked(path)?)?))}).await
+}
+#[tauri::command]
+async fn export_calendar_ics(app:AppHandle,id:String)->Result<bool,String>{
+    let handle=app.clone();
+    work(app,move|s|{let Some(path)=handle.dialog().file().set_file_name("event.ics").add_filter("iCalendar",&["ics"]).blocking_save_file()else{return Ok(false)};s.export_calendar_event(&id,&picked(path)?)?;Ok(true)}).await
+}
+#[tauri::command]
+async fn message_invitations(app:AppHandle,id:i64)->Result<Vec<Invitation>,String>{work(app,move|s|s.message_invitations(id)).await}
+#[tauri::command]
+async fn add_invitation(app:AppHandle,id:i64,index:usize)->Result<ImportReport,String>{work(app,move|s|s.add_invitation(id,index)).await}
+#[tauri::command]
+async fn invitation_reply(app:AppHandle,id:i64,index:usize,account_id:String,partstat:String)->Result<Compose,String>{work(app,move|s|s.invitation_reply(id,index,&account_id,&partstat)).await}
+#[tauri::command]
+async fn meeting_invitation(app:AppHandle,id:String,account_id:String,recipients:String)->Result<Compose,String>{work(app,move|s|s.meeting_invitation(&id,&account_id,&recipients)).await}
+#[tauri::command]
+async fn notification_enabled(app:AppHandle)->Result<bool,String>{work(app,|s|s.notification_enabled()).await}
+#[tauri::command]
+async fn set_notifications(app:AppHandle,enabled:bool)->Result<(),String>{
+    let handle=app.clone();
+    work(app,move|s|{
+        use tauri::plugin::PermissionState;
+        if enabled{
+            let state=handle.notification().permission_state()?;
+            if state!=PermissionState::Granted && handle.notification().request_permission()?!=PermissionState::Granted{anyhow::bail!("System notification permission was not granted")}
+        }
+        s.set_notifications(enabled)
+    }).await
+}
+
 fn main(){
-    tauri::Builder::default().plugin(tauri_plugin_dialog::init()).setup(|app| {
+    tauri::Builder::default().plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_notification::init()).setup(|app| {
         let root=app.path().app_data_dir()?;
         fs::create_dir_all(&root)?;
         let settings=root.join("storage-location.json");
         let dir=configured_location(&settings,&root)?;
         Store::open(&dir)?;
         app.manage(DataLocation{active:dir.clone(),settings});
+        let reminder_dir=dir.clone();
+        let reminder_handle=app.handle().clone();
+        std::thread::spawn(move||loop {
+            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            if let Ok(count)=Store::open(&reminder_dir).and_then(|mut store|store.claim_reminders(now)){
+                if count>0{
+                    let _=reminder_handle.notification().builder().title("Mail EX").body(format!("{count} calendar reminder(s)")).show();
+                    let _=reminder_handle.emit("calendar-reminder",count);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
         let handle=app.handle().clone();
         std::thread::spawn(move||loop {
             let result=Store::open(&dir).and_then(|mut store|store.dispatch_outbox(None));
@@ -248,5 +320,5 @@ fn main(){
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
         Ok(())
-    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox,storage_stats,pending_storage,import_mail_files,export_mail_eml,export_mail_mbox,delete_local_mail,import_contacts_csv,export_contacts_csv,import_accounts_json,export_accounts_json,cache_preview,clear_cache,optimize_storage,create_backup,restore_backup,copy_storage]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
+    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox,storage_stats,pending_storage,import_mail_files,export_mail_eml,export_mail_mbox,delete_local_mail,import_contacts_csv,export_contacts_csv,import_accounts_json,export_accounts_json,cache_preview,clear_cache,optimize_storage,create_backup,restore_backup,copy_storage,add_pop_account,list_calendar_events,save_calendar_event,delete_calendar_event,list_calendar_sources,add_calendar_source,remove_calendar_source,sync_calendar,import_calendar_ics,export_calendar_ics,message_invitations,add_invitation,invitation_reply,meeting_invitation,notification_enabled,set_notifications]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
 }

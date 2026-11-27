@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment, type OAuthRequest, type BatchOperation, type SearchFilters, type Contact, type MailTemplate, type SavedSearch, type LabelCount, type OutboxItem } from './api'
+import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment, type OAuthRequest, type BatchOperation, type SearchFilters, type Contact, type MailTemplate, type SavedSearch, type LabelCount, type OutboxItem, type Invitation } from './api'
 import {listen,type UnlistenFn} from '@tauri-apps/api/event'
 import OrganizerPanel from './components/OrganizerPanel.vue'
 import RecipientField from './components/RecipientField.vue'
 import RichEditor from './components/RichEditor.vue'
 import DataPanel from './components/DataPanel.vue'
+import CalendarPanel from './components/CalendarPanel.vue'
+import InvitationPanel from './components/InvitationPanel.vue'
 
 type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'|'outbox'
 type OrganizerTab='contacts'|'templates'|'rules'|'searches'
@@ -22,7 +24,9 @@ watch(listWidth,v=>localStorage.setItem('listWidth',String(v)))
 const accounts=ref<Account[]>([]), folders=ref<Folder[]>([]), messages=ref<Summary[]>([]), drafts=ref<Draft[]>([])
 const selected=ref<Mail|null>(null), expanded=ref<string[]>([])
 const contacts=ref<Contact[]>([]),templates=ref<MailTemplate[]>([]),savedSearches=ref<SavedSearch[]>([]),labels=ref<LabelCount[]>([]),messageLabels=ref<string[]>([]),outbox=ref<OutboxItem[]>([])
-const dataPanel=ref(false)
+const dataPanel=ref(false),calendarPanel=ref(false)
+const invitations=ref<Invitation[]>([]),incomingProtocol=ref<'imap'|'pop3'>('imap')
+let unlistenReminder:UnlistenFn|undefined
 const sendingAccounts=computed(()=>accounts.value.filter(a=>a.auth_kind!=='local'))
 const organizerTab=ref<OrganizerTab|null>(null),activeSavedId=ref(''),templateChoice=ref(''),templateName=ref('')
 const scheduleEnabled=ref(false),scheduleAt=ref(''),deliveryRequestId=ref('')
@@ -35,7 +39,7 @@ const dialog=ref<'account'|'compose'|'oauth'|null>(null), editId=ref<string|null
 const preset=ref('custom')
 const oauthForm=ref<OAuthRequest>({provider:'google',client_id:'',desktop_client_secret:'',email:'',name:'',color:'#507ed8',account_id:null})
 const oauthWaiting=ref(false),oauthCanceling=ref(false)
-const editingOAuth=computed(()=>!!editId.value&&accounts.value.find(a=>a.id===editId.value)?.auth_kind!=='password')
+const editingOAuth=computed(()=>!!editId.value&&!['password','pop3'].includes(accounts.value.find(a=>a.id===editId.value)?.auth_kind||''))
 const advanced=ref(false)
 const blankFilters=()=>({sender:'',recipient:'',subject:'',label:'',fromDate:'',toDate:''})
 const filters=ref(blankFilters()),appliedFilters=ref<SearchFilters>({sender:'',recipient:'',subject:'',since:null,until:null})
@@ -43,7 +47,7 @@ const batchIds=ref<number[]>([]),batchDestination=ref('')
 const selectedRows=computed(()=>messages.value.filter(m=>batchIds.value.includes(m.id)))
 const batchFolders=computed(()=>{
   const rows=selectedRows.value
-  if(!rows.length||rows.some(m=>m.account_id!==rows[0].account_id))return []
+  if(!rows.length||rows.some(m=>m.account_id!==rows[0].account_id)||['local','pop3'].includes(accounts.value.find(a=>a.id===rows[0].account_id)?.auth_kind||''))return []
   return folders.value.filter(f=>f.account_id===rows[0].account_id&&f.available&&!rows.some(m=>m.folder===f.name))
 })
 function localDate(s:string,next=false):number|null{
@@ -76,7 +80,7 @@ async function applyBatch(operation:BatchOperation){
 }
 function startOAuth(account?:Account){
   if(busy.value)return
-  if(account?.auth_kind==='password'||account?.auth_kind==='local')return
+  if(account?.auth_kind==='password'||account?.auth_kind==='local'||account?.auth_kind==='pop3')return
   oauthForm.value={provider:account?.auth_kind||'google',client_id:'',desktop_client_secret:'',email:account?.email||form.value.email,name:account?.name||form.value.name,color:account?.color||form.value.color,account_id:account?.id||null}
   error.value='';dialog.value='oauth'
 }
@@ -114,7 +118,7 @@ const fileSize=(size:number)=>size<1024?size+' B':size<1024*1024?(size/1024).toF
 const attachedSize=(a:OutgoingAttachment)=>Math.max(0,Math.floor(a.data.length*3/4)-(a.data.endsWith('==')?2:a.data.endsWith('=')?1:0))
 const currentAccount=computed(()=>accounts.value.find(a=>a.id===accountId.value))
 const currentFolder=computed(()=>folders.value.find(f=>f.account_id===accountId.value&&f.name===folderName.value))
-const selectedFolders=computed(()=>folders.value.filter(f=>f.account_id===selected.value?.account_id&&f.name!==selected.value?.folder&&f.available))
+const selectedFolders=computed(()=>['local','pop3'].includes(accounts.value.find(a=>a.id===selected.value?.account_id)?.auth_kind||'')?[]:folders.value.filter(f=>f.account_id===selected.value?.account_id&&f.name!==selected.value?.folder&&f.available))
 const archiveFolder=computed(()=>selectedFolders.value.find(f=>f.kind==='archive'))
 const trashFolder=computed(()=>selectedFolders.value.find(f=>f.kind==='trash'))
 const folderLabel=(f:Folder)=>f.kind==='local'?t('Imported mail','导入邮件'):f.kind==='inbox'?t('Inbox','收件箱'):f.kind==='sent'?t('Sent','已发送'):f.kind==='drafts'?t('Server drafts','服务器草稿'):f.kind==='trash'?t('Trash','废纸篓'):f.kind==='junk'?t('Junk','垃圾邮件'):f.kind==='archive'?t('Archive','归档'):f.label
@@ -182,7 +186,7 @@ async function refreshDrafts(){drafts.value=await api.drafts()}
 async function load(reset=true,preserve=false){
   const token=++generation
   const previous=preserve?selected.value:null
-  if(reset){offset.value=0;selected.value=null;messageLabels.value=[];preview.value=null;batchIds.value=[];batchDestination.value='';detailGeneration++}
+  if(reset){offset.value=0;selected.value=null;invitations.value=[];messageLabels.value=[];preview.value=null;batchIds.value=[];batchDestination.value='';detailGeneration++}
   if(mode.value==='outbox'){messages.value=[];more.value=false;loading.value=false;try{await refreshOutbox()}catch(e){error.value=errorText(e)}return}
   if(mode.value==='drafts'){messages.value=[];more.value=false;loading.value=false;try{await refreshDrafts()}catch(e){error.value=errorText(e)}return}
   loading.value=true
@@ -207,11 +211,12 @@ function view(id:string|null,kind:View='inbox',folder='INBOX'){
 function toggleExpand(id:string){
   expanded.value=expanded.value.includes(id)?expanded.value.filter(x=>x!==id):[...expanded.value,id]
 }
-function newAccount(){form.value=blankAccount();preset.value='custom';editId.value=null;error.value='';dialog.value='account'}
+function newAccount(){incomingProtocol.value='imap';form.value=blankAccount();preset.value='custom';editId.value=null;error.value='';dialog.value='account'}
 function editAccount(){
   const a=currentAccount.value;if(!a)return
-  const {id,auth_kind:_,...data}=a;editId.value=id;form.value={...data,password:''};preset.value='custom';error.value='';dialog.value='account'
+  incomingProtocol.value=a.auth_kind==='pop3'?'pop3':'imap';const {id,auth_kind:_,...data}=a;editId.value=id;form.value={...data,password:''};preset.value='custom';error.value='';dialog.value='account'
 }
+function changeIncoming(){preset.value='custom';form.value.imap_host='';form.value.imap_port=incomingProtocol.value==='pop3'?995:993}
 function applyPreset(){
   const p:Record<string,[string,string,number,boolean]>={qq:['imap.qq.com','smtp.qq.com',465,false],net163:['imap.163.com','smtp.163.com',465,false],net126:['imap.126.com','smtp.126.com',465,false],icloud:['imap.mail.me.com','smtp.mail.me.com',587,true],gmail:['imap.gmail.com','smtp.gmail.com',465,false]}
   const v=p[preset.value]
@@ -224,7 +229,7 @@ function closeDialog(){
 }
 async function saveAccount(){await run(async()=>{
   const input={...form.value,username:form.value.username.trim()||form.value.email.trim(),name:form.value.name.trim()||form.value.email.trim()}
-  const a=editId.value?await api.update(editId.value,input):await api.add(input)
+  const a=editId.value?await api.update(editId.value,input):incomingProtocol.value==='pop3'?await api.addPop(input):await api.add(input)
   form.value=blankAccount();dialog.value=null;await refreshAccounts();view(a.id,'folder');status.value=t('Account saved. Test or sync to verify access.','账号已保存，请测试连接或同步。')
 })}
 async function testAccount(){const id=accountId.value;if(id)await run(async()=>{status.value=await api.test(id)})}
@@ -244,7 +249,7 @@ async function sync(all=false,automatic=false){await run(async()=>{
   if(failures.length)error.value=failures.join('\n')
 })}
 async function remove(){const a=currentAccount.value;if(!a||!confirm(t('Remove this account and its local cache? Server mail is not deleted.','移除此账号及本地缓存？不会删除服务器邮件。')))return;await run(async()=>{await api.remove(a.id);await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();view(null)})}
-async function open(m:Summary){const token=++detailGeneration;try{const [result,categories]=await Promise.all([api.message(m.id),api.messageLabels(m.id)]);if(token===detailGeneration){selected.value=result;messageLabels.value=categories;destination.value='';readMode.value=result.html!==null?'html':'plain';preview.value=null}}catch(e){if(token===detailGeneration)error.value=errorText(e)}}
+async function open(m:Summary){const token=++detailGeneration;try{const [result,categories,meetings]=await Promise.all([api.message(m.id),api.messageLabels(m.id),api.invitations(m.id).catch(()=>[] as Invitation[])]);if(token===detailGeneration){selected.value=result;invitations.value=meetings;messageLabels.value=categories;destination.value='';readMode.value=result.html!==null?'html':'plain';preview.value=null}}catch(e){if(token===detailGeneration)error.value=errorText(e)}}
 async function toggleSeen(){const m=selected.value;if(!m)return;await run(async()=>{await api.seen(m.id,!m.seen);await refreshAccounts();await load(true,true)})}
 async function toggleStar(){const m=selected.value;if(!m)return;await run(async()=>{await api.star(m.id,!m.starred);await load(true,true)})}
 async function moveTo(name:string){
@@ -368,11 +373,11 @@ function resize(event:PointerEvent,which:'nav'|'list'){
   document.addEventListener('pointermove',move);document.addEventListener('pointerup',done);document.addEventListener('pointercancel',done)
 }
 onMounted(async()=>{
-  try{await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();await load();unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})})}catch(e){error.value=errorText(e)}
-  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&!dataPanel.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
+  try{await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();await load();unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})});unlistenReminder=await listen<number>('calendar-reminder',e=>{status.value=t('Calendar reminders: ','日程提醒：')+e.payload})}catch(e){error.value=errorText(e)}
+  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&!dataPanel.value&&!calendarPanel.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
   draftTimer=window.setInterval(()=>{if(autosave.value&&dialog.value==='compose'&&dirty.value&&!busy.value)void run(()=>persistDraft(false))},5000)
 })
-onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.()})
+onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.();unlistenReminder?.()})
 </script>
 
 <template>
@@ -413,13 +418,14 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       </div>
       <div v-if="!accounts.length" class="hint">{{t('Add your first mailbox to get started.','添加第一个邮箱以开始使用。')}}</div>
       <button class="add" @click="newAccount">＋ {{t('Add account','添加账号')}}</button>
+      <button class="nav-row" @click="calendarPanel=true" :disabled="busy">▦ <span class="nav-label">{{t('Calendar','日历')}}</span></button>
       <button class="nav-row" @click="dataPanel=true" :disabled="busy"><span class="folder-symbol">⚙</span><span class="nav-label">{{t('Data management','数据管理')}}</span></button>
       <div class="nav-footer">{{t('Local-first · No Mail EX cloud','本地优先 · 无强制云服务')}}</div>
     </aside>
     <div class="split" role="separator" aria-orientation="vertical" @pointerdown="resize($event,'nav')"></div>
     <section class="message-list">
       <div class="list-head"><h1>{{title}}</h1><div class="toolbar">
-        <template v-if="mode!=='drafts'&&mode!=='outbox'"><button v-if="currentAccount?.auth_kind!=='local'" @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'&&currentAccount.auth_kind!=='local'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button><button :disabled="busy" @click="exportFolder">{{t('Export folder / scope (MBOX)','导出文件夹／范围 (MBOX)')}}</button></template>
+        <template v-if="mode!=='drafts'&&mode!=='outbox'"><button v-if="currentAccount?.auth_kind!=='local'" @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'&&currentAccount.auth_kind!=='local'&&currentAccount.auth_kind!=='pop3'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='local'" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button><button :disabled="busy" @click="exportFolder">{{t('Export folder / scope (MBOX)','导出文件夹／范围 (MBOX)')}}</button></template>
         <template v-else-if="mode==='outbox'"><button :disabled="busy" @click="run(refreshOutbox)">↻ {{t('Refresh','刷新')}}</button><button @click="compose">{{t('New message','写邮件')}}</button></template>
         <button v-else @click="compose">{{t('New draft','新建草稿')}}</button>
       </div></div>
@@ -473,6 +479,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
         </div>
         
         <article>
+          <InvitationPanel v-if="invitations.length" :zh="zh" :message-id="selected.id" :invitations="invitations" :accounts="accounts" :disabled="busy" @compose="startCompose" @status="status=$event" @error="error=$event"/>
           <h2>{{selected.subject||t('(No subject)','（无主题）')}}</h2><div class="sender">{{selected.sender}}</div><div class="muted">{{t('To: ','收件人：')}}{{selected.recipients}}</div><div class="muted">{{owner(selected.account_id)?.email}} · {{date(selected.timestamp)}}</div><div v-if="messageLabels.length" class="message-labels"><button v-for="label in messageLabels" :key="label" @click="viewLabel(label)">{{label}}</button></div>
           <div v-if="selected.attachments.length" class="attachment-panel">
             <div class="attachment-title">{{t('Attachments','附件')}} ({{selected.attachments.length}})</div>
@@ -496,13 +503,15 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
     <form v-if="dialog==='account'" class="modal" @submit.prevent="saveAccount">
       <div class="modal-head"><h2>{{editId?t('Edit mailbox','编辑邮箱'):t('Add mailbox','添加邮箱')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>
       <button v-if="!editId" type="button" class="oauth-entry" @click="startOAuth()">{{t('Sign in with Google or Microsoft (OAuth 2.0)','使用 Google 或 Microsoft 登录（OAuth 2.0）')}}</button>
-      <label v-if="!editId">{{t('Provider','服务商')}}<select v-model="preset" @change="applyPreset"><option value="custom">{{t('Custom IMAP / SMTP','自定义 IMAP / SMTP')}}</option><option value="qq">QQ Mail</option><option value="net163">163 Mail</option><option value="net126">126 Mail</option><option value="icloud">iCloud Mail</option><option value="gmail">Gmail (app password)</option></select></label>
+      <label>{{t('Incoming protocol','收件协议')}}<select v-model="incomingProtocol" :disabled="!!editId" @change="changeIncoming"><option value="imap">IMAP TLS</option><option value="pop3">POP3 TLS</option></select></label>
+      <p v-if="incomingProtocol==='pop3'" class="hint">{{t('POP3 downloads inbox mail and keeps server copies. Read/star flags and optional Sent copy are local.','POP3 下载收件箱并保留服务器副本，已读、星标及可选已发送副本仅保存在本地。')}}</p>
+      <label v-if="!editId&&incomingProtocol==='imap'">{{t('Provider','服务商')}}<select v-model="preset" @change="applyPreset"><option value="custom">{{t('Custom IMAP / SMTP','自定义 IMAP / SMTP')}}</option><option value="qq">QQ Mail</option><option value="net163">163 Mail</option><option value="net126">126 Mail</option><option value="icloud">iCloud Mail</option><option value="gmail">Gmail (app password)</option></select></label>
       <p class="hint">{{editId?t('Leave password blank to keep it. To change the incoming mailbox identity, add a new account.','密码留空则保留原凭据。若需更改收件账号身份，请添加新账号。'):t('Use the provider’s app password or authorization code where required. Google and Microsoft OAuth use the separate sign-in flow.','按服务商要求使用应用专用密码或授权码。Google 和 Microsoft 使用单独的 OAuth 登录入口。')}}</p>
       <label>{{t('Display name','显示名称')}}<input v-model="form.name"></label>
       <label>{{t('Email address','邮箱地址')}}<input v-model="form.email" type="email" required :disabled="!!editId"></label>
       <label>{{t('Login username (optional)','登录名（可选）')}}<input v-model="form.username" autocomplete="off" :disabled="!!editId"></label>
       <label v-if="!editingOAuth">{{t('Password / authorization code','密码 / 授权码')}}<input v-model="form.password" type="password" autocomplete="new-password" :required="!editId"></label>
-      <div class="field-grid"><label>IMAP TLS<input v-model="form.imap_host" placeholder="imap.example.com" required :disabled="!!editId"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.imap_port" min="1" max="65535" required :disabled="!!editId"></label><label>SMTP<input v-model="form.smtp_host" placeholder="smtp.example.com" required :disabled="editingOAuth"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.smtp_port" min="1" max="65535" required :disabled="editingOAuth"></label></div>
+      <div class="field-grid"><label>{{incomingProtocol==='pop3'?'POP3 TLS':'IMAP TLS'}}<input v-model="form.imap_host" :placeholder="incomingProtocol==='pop3'?'pop.example.com':'imap.example.com'" required :disabled="!!editId"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.imap_port" min="1" max="65535" required :disabled="!!editId"></label><label>SMTP<input v-model="form.smtp_host" placeholder="smtp.example.com" required :disabled="editingOAuth"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.smtp_port" min="1" max="65535" required :disabled="editingOAuth"></label></div>
       <label class="inline-label"><input type="checkbox" v-model="form.smtp_starttls" :disabled="editingOAuth"> {{t('SMTP required STARTTLS (otherwise implicit TLS)','SMTP 强制 STARTTLS（否则使用隐式 TLS）')}}</label>
       <label class="inline-label">{{t('Account color','账号颜色')}} <input type="color" v-model="form.color"></label>
       <label>{{t('Default email signature','默认邮件签名')}}<textarea v-model="form.signature" rows="3" :placeholder="t('Optional plain-text signature','可选纯文本签名')"></textarea></label>
@@ -538,13 +547,14 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
         <RichEditor v-if="rich" :html="draft.html||''" :zh="zh" :disabled="busy" @update="richUpdate"/>
         <textarea v-else class="compose-body" v-model="draft.body" :placeholder="t('Write your message…','撰写邮件正文…')" rows="12"></textarea>
         <div v-if="composeFiles.length" class="attachment-panel"><div class="attachment-title">{{t('Attachments','附件')}} ({{composeFiles.length}})</div><div v-for="(a,i) in composeFiles" :key="i" class="attachment-row"><span class="attachment-icon">▤</span><div class="attachment-name"><strong>{{a.name}}</strong><small>{{fileSize(attachedSize(a))}}</small></div><button type="button" @click="removeAttachment(i)">×</button></div></div>
-        <label class="inline-label"><input type="checkbox" v-model="draft.save_sent_copy"> {{t('Save an additional copy to the server Sent folder (turn off when the provider does this automatically)','额外保存副本到服务器已发送文件夹（服务商自动保存时请关闭）')}}</label>
+        <label class="inline-label"><input type="checkbox" v-model="draft.save_sent_copy"> {{owner(draft.account_id)?.auth_kind==='pop3'?t('Save a local Sent copy','保存本地已发送副本'):t('Save an additional copy to the server Sent folder (turn off when the provider does this automatically)','额外保存副本到服务器已发送文件夹（服务商自动保存时请关闭）')}}</label>
         <label class="inline-label"><input type="checkbox" v-model="scheduleEnabled"> {{t('Schedule delivery','定时发送')}}</label><label v-if="scheduleEnabled">{{t('Local send time','本地发送时间')}}<input type="datetime-local" v-model="scheduleAt" required><small>{{t('Mail EX must be running; overdue mail sends on the next launch.','Mail EX 需保持运行；退出期间到期的邮件将在下次启动时发送。')}}</small></label>
         <label class="inline-label"><input type="checkbox" v-model="autosave"> {{t('Automatically save local drafts while editing','编辑时自动保存本地草稿')}} <small>{{dirty?t('Unsaved changes','未保存修改'):draftId?t('Saved','已保存'):''}}</small></label>
       </fieldset>
       <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Close','关闭')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{scheduleEnabled?t('Schedule','加入定时队列'):t('Send','发送')}}</button></div>
     </form>
   </div>
+  <CalendarPanel v-if="calendarPanel" :zh="zh" :accounts="accounts" :contacts="contacts" @close="calendarPanel=false" @compose="calendarPanel=false;startCompose($event)"/>
   <DataPanel v-if="dataPanel" :zh="zh" :accounts="accounts" @close="dataPanel=false" @changed="dataChanged"/>
   <OrganizerPanel v-if="organizerTab" :initial-tab="organizerTab" :zh="zh" :accounts="accounts" :search-seed="searchSeed" @close="organizerTab=null" @changed="organizerChanged" @use-search="useSavedSearch"/>
 </div>

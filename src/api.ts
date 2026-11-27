@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
-export interface Account { id:string; name:string; email:string; username:string; imap_host:string; imap_port:number; smtp_host:string; smtp_port:number; smtp_starttls:boolean; color:string; signature:string; auth_kind:'password'|'google'|'microsoft'|'outlook'|'local' }
+export interface Account { id:string; name:string; email:string; username:string; imap_host:string; imap_port:number; smtp_host:string; smtp_port:number; smtp_starttls:boolean; color:string; signature:string; auth_kind:'password'|'google'|'microsoft'|'outlook'|'local'|'pop3' }
 export type NewAccount = Omit<Account,'id'|'auth_kind'> & { password:string }
+export interface CalendarEvent { id:string; source_id:string|null; origin:'local'|'import'|'remote'; uid:string; summary:string; start:string; end:string; all_day:boolean; timezone:string; location:string; description:string; organizer:string; attendees:string[]; sequence:number; recurrence_id:string; recurring:boolean; method:string; reminder_minutes:number|null }
+export interface CalendarSource { id:string; name:string; url:string; username:string; last_sync:number|null }
+export interface NewCalendarSource { name:string; url:string; username:string; password:string }
+export interface Invitation { index:number; event:CalendarEvent }
+export interface CalendarSyncReport { events:number; resources:number }
 export interface ImportReport { added:number; skipped:number; invalid:number }
 export interface StorageStats { directory:string; database_bytes:number; wal_bytes:number; shm_bytes:number; raw_mail_bytes:number; messages:number; local_messages:number; accounts:number; contacts:number; drafts:number; outbox:number }
 export interface CacheReport { messages:number; raw_bytes:number }
@@ -31,6 +36,7 @@ export const api = {
   authorize: (request:OAuthRequest) => invoke<Account>('authorize_account',{request}),
   cancelOAuth: () => invoke<void>('cancel_oauth'),
   add: (account:NewAccount) => invoke<Account>('add_account',{account}),
+  addPop: (account:NewAccount) => invoke<Account>('add_pop_account',{account}),
   update: (id:string,account:NewAccount) => invoke<Account>('update_account',{id,account}),
   remove: (id:string) => invoke<void>('remove_account',{id}),
   folders: () => invoke<Folder[]>('list_folders'),
@@ -88,5 +94,20 @@ export const api = {
   optimizeStorage: () => invoke<void>('optimize_storage'),
   createBackup: () => invoke<SnapshotReport|null>('create_backup'),
   restoreBackup: () => invoke<SnapshotReport|null>('restore_backup'),
-  copyStorage: () => invoke<SnapshotReport|null>('copy_storage')
+  copyStorage: () => invoke<SnapshotReport|null>('copy_storage'),
+  calendarEvents: () => invoke<CalendarEvent[]>('list_calendar_events'),
+  saveEvent: (event:CalendarEvent) => invoke<CalendarEvent>('save_calendar_event',{event}),
+  deleteEvent: (id:string) => invoke<void>('delete_calendar_event',{id}),
+  calendarSources: () => invoke<CalendarSource[]>('list_calendar_sources'),
+  addCalendarSource: (source:NewCalendarSource) => invoke<CalendarSource>('add_calendar_source',{source}),
+  removeCalendarSource: (id:string) => invoke<void>('remove_calendar_source',{id}),
+  syncCalendar: (id:string) => invoke<CalendarSyncReport>('sync_calendar',{id}),
+  importIcs: () => invoke<ImportReport|null>('import_calendar_ics'),
+  exportIcs: (id:string) => invoke<boolean>('export_calendar_ics',{id}),
+  invitations: (id:number) => invoke<Invitation[]>('message_invitations',{id}),
+  addInvitation: (id:number,index:number) => invoke<ImportReport>('add_invitation',{id,index}),
+  invitationReply: (id:number,index:number,accountId:string,partstat:string) => invoke<Compose>('invitation_reply',{id,index,accountId,partstat}),
+  meetingInvite: (id:string,accountId:string,recipients:string) => invoke<Compose>('meeting_invitation',{id,accountId,recipients}),
+  notificationEnabled: () => invoke<boolean>('notification_enabled'),
+  setNotifications: (enabled:boolean) => invoke<void>('set_notifications',{enabled})
 }

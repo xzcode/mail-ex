@@ -11,6 +11,9 @@ mod mime;
 mod oauth;
 mod organizer;
 mod portability;
+mod pop3;
+mod calendar;
+pub use calendar::{CalendarEvent,CalendarSource,NewCalendarSource,Invitation,CalendarSyncReport};
 pub use portability::{ImportReport,StorageStats,CacheReport,SnapshotReport,ARCHIVE_ID};
 pub use organizer::{Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem};
 pub use oauth::OAuthRequest;
@@ -117,11 +120,11 @@ impl Store {
         db.busy_timeout(Duration::from_secs(15))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let initial_version:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if initial_version>7 { bail!("Database belongs to a newer Mail EX version") }
-        if initial_version<7 {
+        if initial_version>8 { bail!("Database belongs to a newer Mail EX version") }
+        if initial_version<8 {
         let migration=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version:i64=migration.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version>7 { bail!("Database belongs to a newer Mail EX version") }
+        if version>8 { bail!("Database belongs to a newer Mail EX version") }
         if version==0 {
             migration.execute_batch("CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL, imap_port INTEGER NOT NULL, smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL, smtp_starttls INTEGER NOT NULL, color TEXT NOT NULL, secret BLOB NOT NULL);
               CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, folder TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, timestamp INTEGER NOT NULL, seen INTEGER NOT NULL, body TEXT NOT NULL, html_only INTEGER NOT NULL, raw BLOB NOT NULL, UNIQUE(account_id,folder,uid_validity,uid));
@@ -174,6 +177,7 @@ impl Store {
         }
         if version<6 { organizer::migrate(&migration)?; }
         if version<7 { portability::migrate(&migration)?; }
+        if version<8 { calendar::migrate(&migration)?; }
         migration.commit()?;
         }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(dir.join("mail.sqlite3"),fs::Permissions::from_mode(0o600))?; }
@@ -196,7 +200,7 @@ impl Store {
     }
     fn credential(&self,a:&Account)->Result<String>{
         if a.auth_kind=="local"{bail!("Local archives have no network credentials")}
-        if a.auth_kind=="password"{let pw=self.password(&a.id)?;if pw.is_empty(){bail!("Imported account requires a password or authorization code")}return Ok(pw)}
+        if matches!(a.auth_kind.as_str(),"password"|"pop3"){let pw=self.password(&a.id)?;if pw.is_empty(){bail!("Imported account requires a password or authorization code")}return Ok(pw)}
         let provider=oauth::Provider::parse(&a.auth_kind)?;
         let (imap,smtp,port,starttls)=provider.servers();
         if a.imap_host!=imap||a.imap_port!=993||a.smtp_host!=smtp||a.smtp_port!=port||a.smtp_starttls!=starttls||a.username!=a.email{bail!("OAuth account endpoint does not match its provider")}
@@ -249,7 +253,9 @@ impl Store {
         }
         tx.commit()?;Ok(a)
     }
-    pub fn add_account(&self,input:NewAccount)->Result<Account>{
+    pub fn add_account(&self,input:NewAccount)->Result<Account>{self.add_password_account(input,"password")}
+    fn add_password_account(&self,input:NewAccount,kind:&str)->Result<Account>{
+        if !matches!(kind,"password"|"pop3"){bail!("Invalid password account type")}
         let email=input.email.trim().to_string();
         let _:Mailbox=email.parse().map_err(|_|anyhow!("Invalid email address"))?;
         if !valid_host(&input.imap_host)||!valid_host(&input.smtp_host)||input.imap_port==0||input.smtp_port==0 {bail!("Invalid mail server host or port")}
@@ -257,10 +263,13 @@ impl Store {
         if input.username.contains(['\r','\n'])||input.password.contains(['\r','\n']) {bail!("Invalid credential characters")}
         let name=if input.name.trim().is_empty(){email.clone()}else{input.name.trim().to_string()};
         let username=if input.username.trim().is_empty(){email.clone()}else{input.username.trim().to_string()};
-        let a=Account{id:Uuid::new_v4().to_string(),name,email,username,imap_host:input.imap_host,imap_port:input.imap_port,smtp_host:input.smtp_host,smtp_port:input.smtp_port,smtp_starttls:input.smtp_starttls,color:input.color,signature:input.signature,auth_kind:"password".into()};
+        let a=Account{id:Uuid::new_v4().to_string(),name,email,username,imap_host:input.imap_host,imap_port:input.imap_port,smtp_host:input.smtp_host,smtp_port:input.smtp_port,smtp_starttls:input.smtp_starttls,color:input.color,signature:input.signature,auth_kind:kind.into()};
         let secret=encrypt(&self.key,&a.id,&input.password)?;
-        self.db.execute("INSERT INTO accounts(id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,secret,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.name,a.email,a.username,a.imap_host,a.imap_port,a.smtp_host,a.smtp_port,a.smtp_starttls,a.color,secret,a.signature])?;
-        self.db.execute("INSERT OR IGNORE INTO folders(account_id,name,label,kind) VALUES(?,'INBOX','INBOX','inbox')",[&a.id])?;
+        let tx=self.db.unchecked_transaction()?;
+        tx.execute("INSERT INTO accounts(id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,secret,signature,auth_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.name,a.email,a.username,a.imap_host,a.imap_port,a.smtp_host,a.smtp_port,a.smtp_starttls,a.color,secret,a.signature,a.auth_kind])?;
+        tx.execute("INSERT OR IGNORE INTO folders(account_id,name,label,kind) VALUES(?,'INBOX','INBOX','inbox')",[&a.id])?;
+        if kind=="pop3"{tx.execute("INSERT OR IGNORE INTO folders(account_id,name,label,kind) VALUES(?,'Sent','Sent (local)','sent')",[&a.id])?;}
+        tx.commit()?;
         Ok(a)
     }
     pub fn update_account(&mut self,id:&str,input:NewAccount)->Result<Account>{
@@ -274,7 +283,7 @@ impl Store {
         if !valid_host(&input.smtp_host)||input.smtp_port==0 {bail!("Invalid SMTP host or port")}
         if input.password.contains(['\r','\n']) {bail!("Invalid credential characters")}
         let name=if input.name.trim().is_empty(){old.email.clone()}else{input.name.trim().to_string()};
-        if old.auth_kind!="password" && (!input.password.is_empty()||input.smtp_host!=old.smtp_host||input.smtp_port!=old.smtp_port||input.smtp_starttls!=old.smtp_starttls){
+        if !matches!(old.auth_kind.as_str(),"password"|"pop3") && (!input.password.is_empty()||input.smtp_host!=old.smtp_host||input.smtp_port!=old.smtp_port||input.smtp_starttls!=old.smtp_starttls){
             bail!("OAuth credentials and server endpoints cannot be changed here; use Reauthorize")
         }
         let secret=if input.password.is_empty(){None}else{Some(encrypt(&self.key,id,&input.password)?)};
@@ -289,15 +298,23 @@ impl Store {
     pub fn remove_account(&self,id:&str)->Result<()>{self.db.execute("DELETE FROM accounts WHERE id=?",[id])?;Ok(())}
     pub fn test_account(&self,id:&str)->Result<String>{
         let a=self.account(id)?;let pw=self.credential(&a)?;
-        let mut session=connect_imap(&a,&pw)?;
-        session.examine("INBOX").context("Cannot access INBOX")?;
-        let _=session.logout();
+        if a.auth_kind=="pop3"{self.test_pop(&a,&pw)?;}else{
+            let mut session=connect_imap(&a,&pw)?;
+            session.examine("INBOX").context("Cannot access INBOX")?;
+            let _=session.logout();
+        }
         let transport=smtp(&a,&pw)?;
         if !transport.test_connection().map_err(|_|anyhow!("SMTP connection/authentication failed"))? {bail!("SMTP server rejected connection")}
-        Ok("IMAP and SMTP connection checks succeeded.".into())
+        Ok(if a.auth_kind=="pop3"{"POP3 and SMTP connection checks succeeded."}else{"IMAP and SMTP connection checks succeeded."}.into())
     }
     pub fn sync_account(&mut self,id:&str,folder:Option<String>,all_folders:bool)->Result<SyncReport>{
-        let a=self.account(id)?;let pw=self.credential(&a)?;
+        let a=self.account(id)?;
+        if a.auth_kind=="pop3" && !all_folders && folder.as_deref()==Some("Sent"){return Ok(SyncReport::default())}
+        let pw=self.credential(&a)?;
+        if a.auth_kind=="pop3"{
+            if !all_folders&&folder.as_deref().is_some_and(|f|f!="INBOX"){bail!("POP3 only synchronizes the inbox")}
+            return self.sync_pop(&a,&pw)
+        }
         let mut session=connect_imap(&a,&pw)?;
         let listed=discover(&mut session)?;
         {
@@ -433,7 +450,7 @@ impl Store {
     fn set_flag(&self,id:i64,flag:&str,value:bool)->Result<()>{
         let (aid,folder,validity,uid)=self.message_location(id)?;
         let a=self.account(&aid)?;
-        if a.auth_kind=="local"{
+        if matches!(a.auth_kind.as_str(),"local"|"pop3"){
             let sql=if flag=="seen"{"UPDATE messages SET seen=? WHERE id=? AND account_id=?"}else{"UPDATE messages SET starred=? WHERE id=? AND account_id=?"};
             self.db.execute(sql,params![value,id,aid])?;return Ok(())
         }
@@ -455,7 +472,9 @@ impl Store {
         if folder==destination {bail!("Source and destination folders are identical")}
         let available:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=? AND name=? AND available=1)",params![aid,destination],|r|r.get(0))?;
         if !available{bail!("Destination is not an available folder of this account")}
-        let a=self.account(&aid)?;let pw=self.credential(&a)?;
+        let a=self.account(&aid)?;
+        if matches!(a.auth_kind.as_str(),"local"|"pop3"){bail!("Server-side moves require an IMAP account")}
+        let pw=self.credential(&a)?;
         let mut session=connect_imap(&a,&pw)?;
         let caps=session.capabilities().context("Cannot check IMAP capabilities")?;
         if !caps.has_str("MOVE"){bail!("Server does not support UID MOVE; no message was changed")}
@@ -528,7 +547,8 @@ impl Store {
         let message=prepare_message(&a,mail)?;
         smtp(&a,&pw)?.send(&message).map_err(|_|anyhow!("SMTP send failed or delivery status is uncertain; check server before retrying"))?;
         let sent_copy=if save_sent_copy {
-            match self.append_sent(&a,&pw,&message){Ok(())=>"saved",Err(_)=>"failed_or_uncertain"}
+            let result=if a.auth_kind=="pop3"{self.append_pop_sent(&a,&message)}else{self.append_sent(&a,&pw,&message)};
+            match result{Ok(())=>"saved",Err(_)=>"failed_or_uncertain"}
         }else{"not_requested"};
         Ok(SendReport{sent_copy:sent_copy.into()})
     }
@@ -616,6 +636,7 @@ fn addresses(s:&str)->Result<Vec<Mailbox>>{
     mail_addresses(s)?.into_iter().map(|s|s.parse::<Mailbox>().map_err(|_|anyhow!("Invalid recipient address"))).collect()
 }
 fn connect_imap(a:&Account,pw:&str)->Result<ImapSession>{
+    if matches!(a.auth_kind.as_str(),"local"|"pop3"){bail!("This account is not an IMAP mailbox")}
     let addresses=(a.imap_host.as_str(),a.imap_port).to_socket_addrs().context("IMAP hostname resolution failed")?;
     let mut stream=None;
     for addr in addresses { if let Ok(s)=TcpStream::connect_timeout(&addr,TIMEOUT){stream=Some(s);break} }
@@ -633,7 +654,7 @@ fn connect_imap(a:&Account,pw:&str)->Result<ImapSession>{
 fn smtp(a:&Account,pw:&str)->Result<SmtpTransport>{
     let builder=if a.smtp_starttls{SmtpTransport::starttls_relay(&a.smtp_host)?}else{SmtpTransport::relay(&a.smtp_host)?};
     let builder=builder.port(a.smtp_port).timeout(Some(TIMEOUT)).credentials(Credentials::new(a.username.clone(),pw.to_owned()));
-    let builder=if a.auth_kind=="password"{builder}else{builder.authentication(vec![lettre::transport::smtp::authentication::Mechanism::Xoauth2])};
+    let builder=if matches!(a.auth_kind.as_str(),"password"|"pop3"){builder}else{builder.authentication(vec![lettre::transport::smtp::authentication::Mechanism::Xoauth2])};
     Ok(builder.build())
 }
 #[derive(Default)]

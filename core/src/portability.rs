@@ -10,7 +10,7 @@ const ARCHIVE_FOLDER:&str="Imported";
 const DB:&str="mail.sqlite3";
 const KEY:&str="vault.key";
 const MANIFEST:&str="mail-ex-backup.json";
-const SCHEMA:i64=7;
+const SCHEMA:i64=8;
 
 pub(crate) fn migrate(db:&Connection)->Result<()>{
     db.execute_batch("ALTER TABLE messages ADD COLUMN import_hash TEXT;
@@ -125,6 +125,9 @@ fn verify_vault(db:&Connection,key:&[u8;32])->Result<()>{
     let mut q=db.prepare("SELECT id,secret FROM accounts WHERE auth_kind<>'local'")?;
     let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
     for row in rows{let (id,secret)=row?;decrypt(key,&id,&secret).context("Backup credential key does not match account data")?;}
+    let mut q=db.prepare("SELECT id,secret FROM calendar_sources")?;
+    let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
+    for row in rows{let (id,secret)=row?;decrypt(key,&id,&secret).context("Backup credential key does not match calendar data")?;}
     Ok(())
 }
 impl Store{
@@ -193,7 +196,7 @@ impl Store{
         let mut report=ImportReport::default();
         for a in config.accounts{
             let valid_identity=a.email.parse::<lettre::Address>().is_ok()&&!a.username.is_empty()&&!a.username.chars().any(char::is_control);
-            let valid_endpoint=if a.auth_kind=="password"{valid_host(&a.imap_host)&&valid_host(&a.smtp_host)&&a.imap_port>0&&a.smtp_port>0}
+            let valid_endpoint=if matches!(a.auth_kind.as_str(),"password"|"pop3"){valid_host(&a.imap_host)&&valid_host(&a.smtp_host)&&a.imap_port>0&&a.smtp_port>0}
             else{super::oauth::Provider::parse(&a.auth_kind).ok().is_some_and(|p|{let (imap,smtp,port,starttls)=p.servers();a.imap_host==imap&&a.imap_port==993&&a.smtp_host==smtp&&a.smtp_port==port&&a.smtp_starttls==starttls&&a.username==a.email})};
             if !valid_identity||!valid_endpoint{report.invalid+=1;continue}
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM accounts WHERE lower(email)=lower(?1) AND username=?2 AND imap_host=?3 AND imap_port=?4)",params![a.email,a.username,a.imap_host,a.imap_port],|r|r.get(0))?;
@@ -210,12 +213,12 @@ impl Store{
         Ok(StorageStats{directory:self.dir.to_string_lossy().into_owned(),database_bytes:file_size(&self.dir.join(DB)),wal_bytes:file_size(&self.dir.join("mail.sqlite3-wal")),shm_bytes:file_size(&self.dir.join("mail.sqlite3-shm")),raw_mail_bytes:self.db.query_row("SELECT coalesce(sum(length(raw)),0) FROM messages",[],|r|r.get(0))?,messages:count("messages")?,local_messages:self.db.query_row("SELECT count(*) FROM messages WHERE account_id=?",[ARCHIVE_ID],|r|r.get(0))?,accounts:count("accounts")?,contacts:count("contacts")?,drafts:count("drafts")?,outbox:count("outbox")?})
     }
     pub fn cache_preview(&self,account_id:Option<String>,before:Option<i64>)->Result<CacheReport>{
-        Ok(self.db.query_row("SELECT count(*),coalesce(sum(length(raw)),0) FROM messages WHERE account_id IN (SELECT id FROM accounts WHERE auth_kind<>'local') AND (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR timestamp<?2)",params![account_id,before],|r|Ok(CacheReport{messages:r.get(0)?,raw_bytes:r.get(1)?}))?)
+        Ok(self.db.query_row("SELECT count(*),coalesce(sum(length(raw)),0) FROM messages WHERE account_id IN (SELECT id FROM accounts WHERE auth_kind NOT IN ('local','pop3')) AND (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR timestamp<?2)",params![account_id,before],|r|Ok(CacheReport{messages:r.get(0)?,raw_bytes:r.get(1)?}))?)
     }
     pub fn clear_cache(&mut self,account_id:Option<String>,before:Option<i64>)->Result<CacheReport>{
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result=tx.query_row("SELECT count(*),coalesce(sum(length(raw)),0) FROM messages WHERE account_id IN (SELECT id FROM accounts WHERE auth_kind<>'local') AND (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR timestamp<?2)",params![account_id,before],|r|Ok(CacheReport{messages:r.get(0)?,raw_bytes:r.get(1)?}))?;
-        tx.execute("DELETE FROM messages WHERE account_id IN (SELECT id FROM accounts WHERE auth_kind<>'local') AND (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR timestamp<?2)",params![account_id,before])?;
+        let result=tx.query_row("SELECT count(*),coalesce(sum(length(raw)),0) FROM messages WHERE account_id IN (SELECT id FROM accounts WHERE auth_kind NOT IN ('local','pop3')) AND (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR timestamp<?2)",params![account_id,before],|r|Ok(CacheReport{messages:r.get(0)?,raw_bytes:r.get(1)?}))?;
+        tx.execute("DELETE FROM messages WHERE account_id IN (SELECT id FROM accounts WHERE auth_kind NOT IN ('local','pop3')) AND (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR timestamp<?2)",params![account_id,before])?;
         tx.commit()?;Ok(result)
     }
     pub fn optimize_storage(&self)->Result<()>{
