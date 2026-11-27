@@ -55,7 +55,10 @@ fn tls_imap_and_smtp_roundtrip() {
     let draft_id=store.save_draft(None,reply).unwrap();
     assert_eq!(store.drafts().unwrap().len(),1);
     store.delete_draft(&draft_id).unwrap();
-    store.move_message(id,"Archive").unwrap();
+    let batch=store.batch(vec![id,id,i64::MAX],"archive",None).unwrap();
+    assert_eq!(batch.succeeded,vec![id]);
+    assert_eq!(batch.failed.len(),1);
+    assert_eq!(batch.failed[0].id,i64::MAX);
     assert!(store.messages(None,Some("INBOX".into()),false,false,"",0).unwrap().is_empty());
     store.sync_account(&account.id,Some("Archive".into()),false).unwrap();
     assert_eq!(store.messages(None,Some("Archive".into()),false,true,"",0).unwrap().len(),1);
@@ -76,4 +79,19 @@ fn tls_imap_and_smtp_roundtrip() {
     let sent_id=sent_list[0].id;
     assert_eq!(store.attachment_download(sent_id,0).unwrap().1,payload);
     assert_eq!(store.message(sent_id).unwrap().html.as_deref().map(str::trim),Some("<p><strong>Local test only.</strong></p>"));
+    let archive=store.messages(None,Some("Archive".into()),false,true,"",0).unwrap();
+    let archived_id=archive[0].id;
+    let ids=vec![archived_id,sent_id];
+    let report=store.batch(ids.clone(),"unread",None).unwrap();
+    assert_eq!(report.succeeded,ids);
+    assert!(report.failed.is_empty());
+    assert!(!store.message(archived_id).unwrap().summary.seen);
+    assert!(!store.message(sent_id).unwrap().summary.seen);
+    let report=store.batch(ids.clone(),"star",None).unwrap();
+    assert_eq!(report.succeeded,ids);
+    assert!(store.message(sent_id).unwrap().summary.starred);
+    let report=store.batch(vec![archived_id],"trash",None).unwrap();
+    assert_eq!(report.succeeded,vec![archived_id]);
+    store.sync_account(&account.id,Some("Trash".into()),false).unwrap();
+    assert_eq!(store.messages(None,Some("Trash".into()),false,true,"Fixture message",0).unwrap().len(),1);
 }
