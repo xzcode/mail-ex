@@ -288,7 +288,8 @@ function startCompose(mail:Compose,id:string|null=null){
 async function beginCompose(mail:Compose,id:string|null=null){
   if(detachedCompose||(!separateCompose.value&&!id)){startCompose(mail,id);return}
   const saved=id||await api.saveDraft(null,mail)
-  try{await api.openComposer(saved);await refreshDrafts()}catch(e){startCompose(mail,saved);error.value=errorText(e)}
+  try{await api.openComposer(saved)}catch(e){startCompose(mail,saved);error.value=errorText(e);return}
+  try{await refreshDrafts()}catch(e){error.value=errorText(e)}
 }
 function compose(){
   if(busy.value)return
@@ -636,12 +637,12 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
           <label>{{t('Language','语言')}}<select v-model="language"><option value="system">{{t('Follow system','跟随系统')}}</option><option value="en">English</option><option value="zh">简体中文</option></select></label>
           <label>{{t('Theme','主题')}}<select v-model="theme"><option value="system">{{t('Follow system','跟随系统')}}</option><option value="light">{{t('Light','浅色')}}</option><option value="soft">{{t('Soft light','柔和浅色')}}</option><option value="gray">{{t('Gray','灰色')}}</option><option value="dark">{{t('Dark','深色')}}</option></select></label>
           <label>{{t('Message list density','邮件列表密度')}}<select v-model="density"><option value="comfortable">{{t('Comfortable','舒适')}}</option><option value="compact">{{t('Compact','紧凑')}}</option></select></label>
-          <label>{{t('Reading font size','阅读字号')}}<input v-model.number="readerFontSize" type="number" min="10" max="32" step="1"></label>
+          <label>{{t('Reading font size','阅读字号')}}<input v-model.number="readerFontSize" type="number" min="10" max="32" step="1" @blur="readerFontSize=Math.min(32,Math.max(10,Number(readerFontSize)||14))"></label>
         </div>
         <button @click="resetLayout">{{t('Reset layout','重置布局')}}</button>
       </div>
       <div class="data-section"><h3>{{t('Mail behavior','邮件行为')}}</h3>
-        <label>{{t('Automatic inbox sync interval (minutes; 0 = manual)','自动同步间隔（分钟；0 为手动）')}}<input v-model.number="autoMinutes" type="number" min="0" step="1"></label>
+        <label>{{t('Automatic inbox sync interval (minutes; 0 = manual)','自动同步间隔（分钟；0 为手动）')}}<input v-model.number="autoMinutes" type="number" min="0" step="1" @blur="autoMinutes=Math.max(0,Math.floor(Number(autoMinutes)||0))"></label>
         <label class="inline-label"><input type="checkbox" v-model="separateCompose">{{t('Open new compose in an independent window','默认使用独立邮件撰写窗口')}}</label>
         <label class="inline-label"><input type="checkbox" v-model="autosave">{{t('Automatically save drafts','自动保存草稿')}}</label>
         <div class="organizer-action-row"><button @click="settingsPanel=false;dataPanel=true">{{t('Storage and backups','存储及备份')}}</button><button @click="settingsPanel=false;calendarPanel=true">{{t('Calendar and notifications','日历及通知')}}</button></div>
