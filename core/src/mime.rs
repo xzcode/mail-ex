@@ -3,9 +3,9 @@
 //! cannot be loaded by a preview.
 use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart, MessageBuilder};
+use lettre::message::{header::{ContentType, ContentTransferEncoding}, Attachment, Body, MultiPart, SinglePart, MessageBuilder};
 use lettre::Message;
-use mailparse::{DispositionType, MailHeaderMap, ParsedMail};
+use mailparse::{DispositionType, ParsedMail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -131,7 +131,8 @@ pub fn build_message(builder:MessageBuilder,body:String,html:Option<String>,atta
     for a in attachments{
         let bytes=STANDARD.decode(a.data).map_err(|_|anyhow!("Invalid attachment data"))?;
         let ct=ContentType::parse(&a.media_type).unwrap_or_else(|_|ContentType::parse("application/octet-stream").expect("valid MIME type"));
-        mixed=mixed.singlepart(Attachment::new(safe_filename(&a.name)).body(bytes,ct));
+        let body=Body::new_with_encoding(bytes,ContentTransferEncoding::Base64).map_err(|_|anyhow!("Cannot encode attachment"))?;
+        mixed=mixed.singlepart(Attachment::new(safe_filename(&a.name)).body(body,ct));
     }
     Ok(builder.multipart(mixed)?)
 }
