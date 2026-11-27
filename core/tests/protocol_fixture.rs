@@ -13,7 +13,7 @@ fn tls_imap_and_smtp_roundtrip() {
         name:"Fixture".into(), email:"fixture@example.invalid".into(),
         username:"fixture@example.invalid".into(), password:"fixture-only-secret".into(),
         imap_host:"localhost".into(), imap_port, smtp_host:"localhost".into(), smtp_port,
-        smtp_starttls:false, color:"#3469c7".into(),
+        smtp_starttls:false, color:"#3469c7".into(), signature:"".into(),
     }).unwrap();
     store.test_account(&account.id).unwrap();
     let first=store.sync_account(&account.id,None,false).unwrap();
@@ -47,6 +47,6 @@ fn tls_imap_and_smtp_roundtrip() {
     store.send(Compose {
         account_id:account.id,to:"receiver@example.invalid".into(),cc:"".into(),
         bcc:"hidden@example.invalid".into(),subject:"Fixture delivery".into(),
-        body:"Local test only.".into(),in_reply_to:None,references:None,
+        body:"Local test only.".into(),in_reply_to:None,references:None,html:None,attachments:Vec::new(),save_sent_copy:false,
     }).unwrap();
 }

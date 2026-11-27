@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft } from './api'
+import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment } from './api'
+import RichEditor from './components/RichEditor.vue'
 
 type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'
 const zh=ref(localStorage.getItem('language')?localStorage.getItem('language')==='zh':navigator.language.toLowerCase().startsWith('zh'))
@@ -15,16 +16,25 @@ watch(navWidth,v=>localStorage.setItem('navWidth',String(v)))
 watch(listWidth,v=>localStorage.setItem('listWidth',String(v)))
 const accounts=ref<Account[]>([]), folders=ref<Folder[]>([]), messages=ref<Summary[]>([]), drafts=ref<Draft[]>([])
 const selected=ref<Mail|null>(null), expanded=ref<string[]>([])
+const readMode=ref<'html'|'plain'>('html'), preview=ref<AttachmentPreview|null>(null)
 const accountId=ref<string|null>(null), mode=ref<View>('inbox'), folderName=ref('INBOX')
 const query=ref(''), offset=ref(0), more=ref(false), destination=ref('')
 const status=ref(''), error=ref(''), busy=ref(false), loading=ref(false)
 const dialog=ref<'account'|'compose'|null>(null), editId=ref<string|null>(null), draftId=ref<string|null>(null)
 const preset=ref('custom')
-const blankAccount=():NewAccount=>({name:'',email:'',username:'',password:'',imap_host:'',imap_port:993,smtp_host:'',smtp_port:465,smtp_starttls:false,color:'#507ed8'})
+const blankAccount=():NewAccount=>({name:'',email:'',username:'',password:'',imap_host:'',imap_port:993,smtp_host:'',smtp_port:465,smtp_starttls:false,color:'#507ed8',signature:''})
 const form=ref<NewAccount>(blankAccount())
-const blankCompose=():Compose=>({account_id:accountId.value||accounts.value[0]?.id||'',to:'',cc:'',bcc:'',subject:'',body:''})
+const blankCompose=():Compose=>({account_id:accountId.value||accounts.value[0]?.id||'',to:'',cc:'',bcc:'',subject:'',body:'',html:null,attachments:[],save_sent_copy:false})
 const draft=ref<Compose>(blankCompose())
-const draftBaseline=ref('')
+const revision=ref(0),savedRevision=ref(0),autosave=ref(localStorage.getItem('draftAutosave')!=='off')
+watch(draft,()=>{revision.value++},{deep:true,flush:'sync'})
+watch(autosave,v=>localStorage.setItem('draftAutosave',v?'on':'off'))
+const dirty=computed(()=>revision.value!==savedRevision.value)
+const attachmentInput=ref<HTMLInputElement|null>(null)
+const composeFiles=computed(()=>draft.value.attachments||[])
+const rich=computed(()=>draft.value.html!==null&&draft.value.html!==undefined)
+const fileSize=(size:number)=>size<1024?size+' B':size<1024*1024?(size/1024).toFixed(1)+' KiB':(size/(1024*1024)).toFixed(1)+' MiB'
+const attachedSize=(a:OutgoingAttachment)=>Math.max(0,Math.floor(a.data.length*3/4)-(a.data.endsWith('==')?2:a.data.endsWith('=')?1:0))
 const currentAccount=computed(()=>accounts.value.find(a=>a.id===accountId.value))
 const currentFolder=computed(()=>folders.value.find(f=>f.account_id===accountId.value&&f.name===folderName.value))
 const selectedFolders=computed(()=>folders.value.filter(f=>f.account_id===selected.value?.account_id&&f.name!==selected.value?.folder&&f.available))
@@ -38,7 +48,7 @@ const errorText=(e:unknown)=>typeof e==='string'?e:e instanceof Error?e.message:
 const owner=(id:string)=>accounts.value.find(a=>a.id===id)
 const folderOf=(m:Summary)=>folders.value.find(f=>f.account_id===m.account_id&&f.name===m.folder)
 const date=(n:number)=>n?new Date(n*1000).toLocaleString(zh.value?'zh-CN':undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):''
-let generation=0,detailGeneration=0,lastAuto=Date.now(),timer:number|undefined
+let generation=0,detailGeneration=0,lastAuto=Date.now(),timer:number|undefined,draftTimer:number|undefined
 async function refreshAccounts(){
   const old=new Set(accounts.value.map(a=>a.id))
   accounts.value=await api.accounts()
@@ -50,7 +60,7 @@ async function refreshDrafts(){drafts.value=await api.drafts()}
 async function load(reset=true,preserve=false){
   const token=++generation
   const previous=preserve?selected.value:null
-  if(reset){offset.value=0;selected.value=null;detailGeneration++}
+  if(reset){offset.value=0;selected.value=null;preview.value=null;detailGeneration++}
   if(mode.value==='drafts'){messages.value=[];more.value=false;loading.value=false;try{await refreshDrafts()}catch(e){error.value=errorText(e)}return}
   loading.value=true
   try{
@@ -86,7 +96,7 @@ function applyPreset(){
 }
 function closeDialog(){
   if(busy.value)return
-  if(dialog.value==='compose'&&JSON.stringify(draft.value)!==draftBaseline.value&&!confirm(t('Discard unsaved changes? Use Save draft to keep them.','放弃尚未保存的修改？使用保存草稿可保留。')))return
+  if(dialog.value==='compose'&&dirty.value&&!confirm(t('Close without saving the latest changes?','关闭且不保存最近的修改？')))return
   form.value.password='';dialog.value=null
 }
 async function saveAccount(){await run(async()=>{
@@ -111,7 +121,7 @@ async function sync(all=false,automatic=false){await run(async()=>{
   if(failures.length)error.value=failures.join('\n')
 })}
 async function remove(){const a=currentAccount.value;if(!a||!confirm(t('Remove this account and its local cache? Server mail is not deleted.','移除此账号及本地缓存？不会删除服务器邮件。')))return;await run(async()=>{await api.remove(a.id);await refreshAccounts();await refreshDrafts();view(null)})}
-async function open(m:Summary){const token=++detailGeneration;try{const result=await api.message(m.id);if(token===detailGeneration){selected.value=result;destination.value=''}}catch(e){if(token===detailGeneration)error.value=errorText(e)}}
+async function open(m:Summary){const token=++detailGeneration;try{const result=await api.message(m.id);if(token===detailGeneration){selected.value=result;destination.value='';readMode.value=result.html!==null?'html':'plain';preview.value=null}}catch(e){if(token===detailGeneration)error.value=errorText(e)}}
 async function toggleSeen(){const m=selected.value;if(!m)return;await run(async()=>{await api.seen(m.id,!m.seen);await refreshAccounts();await load(true,true)})}
 async function toggleStar(){const m=selected.value;if(!m)return;await run(async()=>{await api.star(m.id,!m.starred);await load(true,true)})}
 async function moveTo(name:string){
@@ -124,21 +134,95 @@ async function moveTo(name:string){
     catch(e){error.value=t('Move succeeded, but destination refresh failed: ','移动成功，但目标文件夹刷新失败：')+errorText(e)}
   })
 }
+function escapeHtml(value:string){return value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/\r?\n/g,'<br>')}
 function startCompose(mail:Compose,id:string|null=null){
-  draft.value={...mail};draftId.value=id;draftBaseline.value=JSON.stringify(draft.value);dialog.value='compose';error.value=''
+  draft.value={...mail,attachments:[...(mail.attachments||[])],html:mail.html??null,save_sent_copy:mail.save_sent_copy??false}
+  draftId.value=id;savedRevision.value=revision.value;dialog.value='compose';error.value=''
 }
-function compose(){if(!accounts.value.length){newAccount();return}startCompose(blankCompose())}
-async function reply(kind:'reply'|'reply_all'|'forward'){const id=selected.value?.id;if(id!==undefined)await run(async()=>{startCompose(await api.composeFrom(id,kind))})}
-async function saveDraft(){await run(async()=>{
-  draftId.value=await api.saveDraft(draftId.value,{...draft.value});draftBaseline.value=JSON.stringify(draft.value)
-  dialog.value=null;await refreshDrafts();status.value=t('Draft saved locally.','草稿已保存到本地。')
-})}
-async function deleteDraft(d:Draft){if(!confirm(t('Delete this local draft?','删除这份本地草稿？')))return;await run(async()=>{await api.deleteDraft(d.id);await refreshDrafts()})}
+function compose(){
+  if(busy.value)return
+  if(!accounts.value.length){newAccount();return}
+  const mail=blankCompose(),sig=owner(mail.account_id)?.signature
+  if(sig)mail.body='\n\n'+sig
+  startCompose(mail)
+}
+async function editDraft(d:Draft){await run(async()=>{const item=await api.draft(d.id);startCompose(item.mail,item.id)})}
+async function reply(kind:'reply'|'reply_all'|'forward'){
+  const id=selected.value?.id;if(id!==undefined)await run(async()=>{
+    const mail=await api.composeFrom(id,kind),sig=owner(mail.account_id)?.signature
+    if(sig)mail.body='\n\n'+sig+mail.body
+    startCompose(mail)
+  })
+}
+function changeFormat(value:'plain'|'rich'){
+  if(value==='rich'&&!rich.value)draft.value.html=escapeHtml(draft.value.body)
+  if(value==='plain'&&rich.value){
+    if(!confirm(t('Switch to plain text and remove formatting?','切换为纯文本并移除格式？')))return
+    draft.value.html=null
+  }
+}
+function richUpdate(value:{html:string;body:string}){draft.value.html=value.html;draft.value.body=value.body}
+function insertSignature(){
+  const sig=owner(draft.value.account_id)?.signature
+  if(!sig)return
+  if(draft.value.body.includes(sig)&&!confirm(t('This signature already appears in the message. Insert again?','正文已包含签名，仍要再次插入？')))return
+  draft.value.body+='\n\n'+sig
+  if(rich.value)draft.value.html=(draft.value.html||'')+'<br><br>'+escapeHtml(sig)
+}
+function readFile(file:File):Promise<OutgoingAttachment>{
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader()
+    reader.onerror=()=>reject(new Error(t('Cannot read selected file','无法读取选定文件')))
+    reader.onload=()=>{
+      const url=String(reader.result||''),comma=url.indexOf(',')
+      if(comma<0){reject(new Error(t('Invalid file data','无效文件数据')));return}
+      resolve({name:file.name,media_type:file.type||'application/octet-stream',data:url.slice(comma+1)})
+    }
+    reader.readAsDataURL(file)
+  })
+}
+async function addFiles(event:Event){
+  const input=event.target as HTMLInputElement
+  const files=Array.from(input.files||[]);input.value=''
+  if(!files.length)return
+  await run(async()=>{
+    for(const file of files){
+      const a=await readFile(file)
+      draft.value.attachments=[...(draft.value.attachments||[]),a]
+    }
+  })
+}
+function removeAttachment(index:number){draft.value.attachments=composeFiles.value.filter((_,i)=>i!==index)}
+async function viewAttachment(index:number){
+  const id=selected.value?.id;if(id===undefined)return
+  await run(async()=>{const p=await api.preview(id,index);if(selected.value?.id===id)preview.value=p})
+}
+async function downloadAttachment(index:number){
+  const id=selected.value?.id;if(id===undefined)return
+  await run(async()=>{if(await api.download(id,index))status.value=t('Attachment saved.','附件已保存。')})
+}
+async function persistDraft(close:boolean){
+  const current=revision.value
+  const snapshot:Compose={...draft.value,attachments:[...(draft.value.attachments||[])]}
+  draftId.value=await api.saveDraft(draftId.value,snapshot)
+  savedRevision.value=current
+  await refreshDrafts()
+  if(close&&revision.value===current)dialog.value=null
+  status.value=t('Draft saved locally.','草稿已保存到本地。')
+}
+async function saveDraft(){await run(async()=>{await persistDraft(true)})}
+async function deleteDraft(d:Draft){
+  if(!confirm(t('Delete this local draft?','删除这份本地草稿？')))return
+  await run(async()=>{await api.deleteDraft(d.id);await refreshDrafts()})
+}
 async function send(){await run(async()=>{
-  const id=draftId.value;await api.send({...draft.value})
-  dialog.value=null;draftId.value=null;draft.value=blankCompose()
+  const id=draftId.value
+  const report=await api.send({...draft.value,attachments:[...(draft.value.attachments||[])]})
+  dialog.value=null;draftId.value=null;draft.value=blankCompose();savedRevision.value=revision.value
   status.value=t('Accepted by SMTP server.','SMTP 服务器已接受邮件。')
-  if(id){try{await api.deleteDraft(id);await refreshDrafts()}catch(e){error.value=t('Message accepted; local draft cleanup failed: ','邮件已被接受，但本地草稿清理失败：')+errorText(e)}}
+  if(report.sent_copy==='saved')status.value+=' '+t('Sent copy saved to server.','已发送副本已保存。')
+  if(report.sent_copy==='failed_or_uncertain')error.value=t('Message accepted; sent-folder copy failed or is uncertain. Do not send again just to save a copy.','邮件已被接受，但已发送副本保存失败或结果不确定。请勿为保存副本重新发送。')
+  if(id){try{await api.deleteDraft(id);await refreshDrafts()}catch(e){error.value+=(error.value?'\n':'')+t('Message accepted; local draft cleanup failed: ','邮件已被接受，但本地草稿清理失败：')+errorText(e)}}
 })}
 function resize(event:PointerEvent,which:'nav'|'list'){
   event.preventDefault()
@@ -150,8 +234,9 @@ function resize(event:PointerEvent,which:'nav'|'list'){
 onMounted(async()=>{
   try{await refreshAccounts();await refreshDrafts();await load()}catch(e){error.value=errorText(e)}
   timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
+  draftTimer=window.setInterval(()=>{if(autosave.value&&dialog.value==='compose'&&dirty.value&&!busy.value)void run(()=>persistDraft(false))},5000)
 })
-onUnmounted(()=>{if(timer!==undefined)clearInterval(timer)})
+onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer)})
 </script>
 
 <template>
@@ -194,7 +279,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer)})
       </div></div>
       <div class="list-meta">{{mode==='drafts'?currentDrafts.length:messages.length}} {{t('loaded','封已加载')}} <span v-if="loading">{{t('Loading…','加载中…')}}</span></div>
       <div class="items" v-if="mode==='drafts'">
-        <div v-for="d in currentDrafts" :key="d.id" class="draft-row"><button class="mail-row" @click="startCompose(d.mail,d.id)"><div class="mail-line"><strong>{{d.mail.subject||t('(No subject)','（无主题）')}}</strong><time>{{date(d.updated_at)}}</time></div><div class="subject">{{d.mail.to||t('No recipient','未填写收件人')}}</div><small>{{owner(d.mail.account_id)?.name}}</small></button><button class="delete-draft" @click="deleteDraft(d)" :disabled="busy" :title="t('Delete local draft','删除本地草稿')">×</button></div>
+        <div v-for="d in currentDrafts" :key="d.id" class="draft-row"><button class="mail-row" @click="editDraft(d)" :disabled="busy"><div class="mail-line"><strong>{{d.mail.subject||t('(No subject)','（无主题）')}}</strong><time>{{date(d.updated_at)}}</time></div><div class="subject">{{d.mail.to||t('No recipient','未填写收件人')}}</div><small>{{owner(d.mail.account_id)?.name}}</small></button><button class="delete-draft" @click="deleteDraft(d)" :disabled="busy" :title="t('Delete local draft','删除本地草稿')">×</button></div>
         <div class="empty" v-if="!currentDrafts.length"><span>✎</span><p>{{t('No local drafts','没有本地草稿')}}</p></div>
       </div>
       <div v-else class="items">
@@ -215,7 +300,22 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer)})
           <button v-if="archiveFolder" @click="moveTo(archiveFolder.name)" :disabled="busy">{{t('Archive','归档')}}</button><button v-if="trashFolder" class="danger-text" @click="moveTo(trashFolder.name)" :disabled="busy">{{t('Move to trash','移至废纸篓')}}</button>
           <div v-if="selectedFolders.length" class="move-control"><select v-model="destination" :disabled="busy" :aria-label="t('Destination folder','目标文件夹')"><option value="">{{t('Choose folder','选择文件夹')}}</option><option v-for="f in selectedFolders" :key="f.name" :value="f.name">{{folderLabel(f)}}</option></select><button @click="moveTo(destination)" :disabled="busy||!destination">{{t('Move','移动')}}</button></div>
         </div>
-        <article><h2>{{selected.subject||t('(No subject)','（无主题）')}}</h2><div class="sender">{{selected.sender}}</div><div class="muted">{{t('To: ','收件人：')}}{{selected.recipients}}</div><div class="muted">{{owner(selected.account_id)?.email}} · {{date(selected.timestamp)}}</div><hr><p class="notice" v-if="selected.html_only">{{t('HTML-only message: safe preview is not available yet. Original MIME is cached.','此邮件仅有 HTML 内容；安全预览尚未实现，原始邮件已缓存。')}}</p><pre class="body">{{selected.body}}</pre></article>
+        
+        <article>
+          <h2>{{selected.subject||t('(No subject)','（无主题）')}}</h2><div class="sender">{{selected.sender}}</div><div class="muted">{{t('To: ','收件人：')}}{{selected.recipients}}</div><div class="muted">{{owner(selected.account_id)?.email}} · {{date(selected.timestamp)}}</div>
+          <div v-if="selected.attachments.length" class="attachment-panel">
+            <div class="attachment-title">{{t('Attachments','附件')}} ({{selected.attachments.length}})</div>
+            <div class="attachment-row" v-for="a in selected.attachments" :key="a.index">
+              <span class="attachment-icon">▤</span><div class="attachment-name"><strong>{{a.name}}</strong><small>{{fileSize(a.size)}} · {{a.media_type}}</small></div>
+              <button v-if="a.previewable" @click="viewAttachment(a.index)" :disabled="busy">{{t('Preview','预览')}}</button><button @click="downloadAttachment(a.index)" :disabled="busy">{{t('Save…','另存为…')}}</button>
+            </div>
+          </div>
+          <div v-if="preview" class="attachment-preview"><div class="preview-heading"><strong>{{preview.name}}</strong><button @click="preview=null">×</button></div><pre v-if="preview.media_type==='text/plain'" class="body">{{preview.data}}</pre><img v-else-if="['image/png','image/jpeg','image/gif','image/webp'].includes(preview.media_type)" :src="'data:'+preview.media_type+';base64,'+preview.data" :alt="preview.name"></div>
+          <hr>
+          <div v-if="selected.html!==null" class="read-mode"><button :class="{active:readMode==='html'}" @click="readMode='html'">HTML</button><button :class="{active:readMode==='plain'}" @click="readMode='plain'">{{t('Plain text','纯文本')}}</button><small>{{t('External images and active content blocked','已拦截外部图片和活动内容')}}</small></div>
+          <div v-if="readMode==='html'&&selected.html!==null" class="safe-mail-html" v-html="selected.html"></div>
+          <pre v-else class="body">{{selected.body}}</pre>
+        </article>
       </template>
       <div v-else class="empty reading-empty"><span>✉</span><h2>{{mode==='drafts'?t('Choose a draft to edit','选择草稿进行编辑'):t('Select a message','选择一封邮件')}}</h2><p>{{t('Your mail stays on your device.','邮件保存在你的设备中。')}}</p></div>
     </section>
@@ -233,16 +333,26 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer)})
       <div class="field-grid"><label>IMAP TLS<input v-model="form.imap_host" placeholder="imap.example.com" required :disabled="!!editId"></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.imap_port" min="1" max="65535" required :disabled="!!editId"></label><label>SMTP<input v-model="form.smtp_host" placeholder="smtp.example.com" required></label><label>{{t('Port','端口')}}<input type="number" v-model.number="form.smtp_port" min="1" max="65535" required></label></div>
       <label class="inline-label"><input type="checkbox" v-model="form.smtp_starttls"> {{t('SMTP required STARTTLS (otherwise implicit TLS)','SMTP 强制 STARTTLS（否则使用隐式 TLS）')}}</label>
       <label class="inline-label">{{t('Account color','账号颜色')}} <input type="color" v-model="form.color"></label>
+      <label>{{t('Default email signature','默认邮件签名')}}<textarea v-model="form.signature" rows="3" :placeholder="t('Optional plain-text signature','可选纯文本签名')"></textarea></label>
       <div v-if="error" class="error">{{error}}</div>
       <div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Cancel','取消')}}</button><button class="primary" :disabled="busy">{{t('Save account','保存账号')}}</button></div>
     </form>
     <form v-else class="modal compose-modal" @submit.prevent="send">
       <div class="modal-head"><h2>{{draftId?t('Edit draft','编辑草稿'):t('New message','新邮件')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>
-      <label>{{t('From','发件人')}}<select v-model="draft.account_id" required><option v-for="a in accounts" :key="a.id" :value="a.id">{{a.email}}</option></select></label>
-      <label>{{t('To (comma-separated addresses)','收件人（逗号分隔地址）')}}<input v-model="draft.to" required></label>
-      <label>Cc<input v-model="draft.cc"></label><label>Bcc<input v-model="draft.bcc"></label>
-      <label>{{t('Subject','主题')}}<input v-model="draft.subject"></label><textarea v-model="draft.body" :placeholder="t('Write your message…','撰写邮件正文…')" rows="12"></textarea>
-      <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Cancel','取消')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{t('Send','发送')}}</button></div>
+
+      <fieldset class="compose-fields" :disabled="busy">
+        <label>{{t('From','发件人')}}<select v-model="draft.account_id" required><option v-for="a in accounts" :key="a.id" :value="a.id">{{a.email}}</option></select></label>
+        <label>{{t('To (comma-separated addresses)','收件人（逗号分隔地址）')}}<input v-model="draft.to" required></label>
+        <div class="compose-addresses"><label>Cc<input v-model="draft.cc"></label><label>Bcc<input v-model="draft.bcc"></label></div>
+        <label>{{t('Subject','主题')}}<input v-model="draft.subject"></label>
+        <div class="compose-options"><button type="button" :class="{active:!rich}" @click="changeFormat('plain')">{{t('Plain text','纯文本')}}</button><button type="button" :class="{active:rich}" @click="changeFormat('rich')">{{t('Rich text','富文本')}}</button><button v-if="owner(draft.account_id)?.signature" type="button" @click="insertSignature">{{t('Insert signature','插入签名')}}</button><button type="button" @click="attachmentInput?.click()">＋ {{t('Attach files','添加附件')}}</button><input ref="attachmentInput" class="file-input" type="file" multiple @change="addFiles"></div>
+        <RichEditor v-if="rich" :html="draft.html||''" :zh="zh" :disabled="busy" @update="richUpdate"/>
+        <textarea v-else class="compose-body" v-model="draft.body" :placeholder="t('Write your message…','撰写邮件正文…')" rows="12"></textarea>
+        <div v-if="composeFiles.length" class="attachment-panel"><div class="attachment-title">{{t('Attachments','附件')}} ({{composeFiles.length}})</div><div v-for="(a,i) in composeFiles" :key="i" class="attachment-row"><span class="attachment-icon">▤</span><div class="attachment-name"><strong>{{a.name}}</strong><small>{{fileSize(attachedSize(a))}}</small></div><button type="button" @click="removeAttachment(i)">×</button></div></div>
+        <label class="inline-label"><input type="checkbox" v-model="draft.save_sent_copy"> {{t('Save an additional copy to the server Sent folder (turn off when the provider does this automatically)','额外保存副本到服务器已发送文件夹（服务商自动保存时请关闭）')}}</label>
+        <label class="inline-label"><input type="checkbox" v-model="autosave"> {{t('Automatically save local drafts while editing','编辑时自动保存本地草稿')}} <small>{{dirty?t('Unsaved changes','未保存修改'):draftId?t('Saved','已保存'):''}}</small></label>
+      </fieldset>
+      <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Close','关闭')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{t('Send','发送')}}</button></div>
     </form>
   </div>
 </div>

@@ -10,3 +10,5 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 mail-ex-core = { path = "../core" }
 anyhow = "1"
+
+tauri-plugin-dialog = "2"

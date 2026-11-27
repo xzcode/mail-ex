@@ -1,24 +1,26 @@
 use aes_gcm::{aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore}, Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
-use lettre::{message::{header::ContentType, Mailbox}, transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
+use lettre::{message::Mailbox, transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
 use mailparse::{MailHeaderMap, ParsedMail};
 use native_tls::{TlsConnector, TlsStream};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs::{self, OpenOptions}, io::Write, net::{TcpStream, ToSocketAddrs}, path::Path, time::Duration};
 use uuid::Uuid;
+mod mime;
+pub use mime::{AttachmentInfo, AttachmentPreview, OutgoingAttachment};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: String, pub name: String, pub email: String, pub username: String,
     pub imap_host: String, pub imap_port: u16, pub smtp_host: String, pub smtp_port: u16,
-    pub smtp_starttls: bool, pub color: String,
+    pub smtp_starttls: bool, pub color: String, pub signature: String,
 }
 #[derive(Deserialize)]
 pub struct NewAccount {
     pub name: String, pub email: String, pub username: String, pub password: String,
     pub imap_host: String, pub imap_port: u16, pub smtp_host: String, pub smtp_port: u16,
-    pub smtp_starttls: bool, pub color: String,
+    pub smtp_starttls: bool, pub color: String, #[serde(default)] pub signature: String,
 }
 #[derive(Clone, Serialize)]
 pub struct Summary {
@@ -28,11 +30,14 @@ pub struct Summary {
 #[derive(Serialize)]
 pub struct Mail {
     #[serde(flatten)] pub summary: Summary, pub body: String, pub html_only: bool, pub recipients: String,
+    pub html: Option<String>, pub attachments: Vec<AttachmentInfo>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Compose {
     pub account_id: String, pub to: String, pub cc: String, pub bcc: String, pub subject: String, pub body: String,
     #[serde(default)] pub in_reply_to: Option<String>, #[serde(default)] pub references: Option<String>,
+    #[serde(default)] pub html: Option<String>, #[serde(default)] pub attachments: Vec<OutgoingAttachment>,
+    #[serde(default)] pub save_sent_copy: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -46,14 +51,16 @@ pub struct Draft {
 }
 #[derive(Default, Serialize)]
 pub struct SyncReport { pub added: usize, pub folders: usize }
-const ACCOUNT_COLUMNS: &str = "id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color";
+#[derive(Serialize)]
+pub struct SendReport { pub sent_copy: String }
+const ACCOUNT_COLUMNS: &str = "id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,signature";
 const SUMMARY_COLUMNS: &str = "id,account_id,sender,subject,timestamp,seen,folder,starred";
 const TIMEOUT: Duration = Duration::from_secs(45);
 type ImapSession = imap::Session<TlsStream<TcpStream>>;
 
 fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id:r.get(0)?, name:r.get(1)?, email:r.get(2)?, username:r.get(3)?,
-        imap_host:r.get(4)?, imap_port:r.get(5)?, smtp_host:r.get(6)?, smtp_port:r.get(7)?, smtp_starttls:r.get(8)?, color:r.get(9)? })
+        imap_host:r.get(4)?, imap_port:r.get(5)?, smtp_host:r.get(6)?, smtp_port:r.get(7)?, smtp_starttls:r.get(8)?, color:r.get(9)?, signature:r.get(10)? })
 }
 fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
     Ok(Summary { id:r.get(0)?, account_id:r.get(1)?, sender:r.get(2)?, subject:r.get(3)?, timestamp:r.get(4)?, seen:r.get(5)?, folder:r.get(6)?, starred:r.get(7)? })
@@ -97,11 +104,11 @@ impl Store {
         db.busy_timeout(Duration::from_secs(15))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let initial_version:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if initial_version>2 { bail!("Database belongs to a newer Mail EX version") }
-        if initial_version<2 {
+        if initial_version>3 { bail!("Database belongs to a newer Mail EX version") }
+        if initial_version<3 {
         let migration=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version:i64=migration.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version>2 { bail!("Database belongs to a newer Mail EX version") }
+        if version>3 { bail!("Database belongs to a newer Mail EX version") }
         if version==0 {
             migration.execute_batch("CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL, imap_port INTEGER NOT NULL, smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL, smtp_starttls INTEGER NOT NULL, color TEXT NOT NULL, secret BLOB NOT NULL);
               CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, folder TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, timestamp INTEGER NOT NULL, seen INTEGER NOT NULL, body TEXT NOT NULL, html_only INTEGER NOT NULL, raw BLOB NOT NULL, UNIQUE(account_id,folder,uid_validity,uid));
@@ -117,6 +124,13 @@ impl Store {
               CREATE INDEX messages_folder_flags ON messages(account_id,folder,starred,seen);
               CREATE TABLE drafts(id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, recipients TEXT NOT NULL, cc TEXT NOT NULL, bcc TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, updated_at INTEGER NOT NULL, in_reply_to TEXT, refs TEXT);
               PRAGMA user_version=2;")?;
+        }
+        if version<3 {
+            migration.execute_batch("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';
+              ALTER TABLE drafts ADD COLUMN html TEXT;
+              ALTER TABLE drafts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
+              ALTER TABLE drafts ADD COLUMN save_sent_copy INTEGER NOT NULL DEFAULT 0;
+              PRAGMA user_version=3;")?;
         }
         migration.commit()?;
         }
@@ -146,9 +160,9 @@ impl Store {
         if input.username.contains(['\r','\n'])||input.password.contains(['\r','\n']) {bail!("Invalid credential characters")}
         let name=if input.name.trim().is_empty(){email.clone()}else{input.name.trim().to_string()};
         let username=if input.username.trim().is_empty(){email.clone()}else{input.username.trim().to_string()};
-        let a=Account{id:Uuid::new_v4().to_string(),name,email,username,imap_host:input.imap_host,imap_port:input.imap_port,smtp_host:input.smtp_host,smtp_port:input.smtp_port,smtp_starttls:input.smtp_starttls,color:input.color};
+        let a=Account{id:Uuid::new_v4().to_string(),name,email,username,imap_host:input.imap_host,imap_port:input.imap_port,smtp_host:input.smtp_host,smtp_port:input.smtp_port,smtp_starttls:input.smtp_starttls,color:input.color,signature:input.signature};
         let secret=encrypt(&self.key,&a.id,&input.password)?;
-        self.db.execute("INSERT INTO accounts(id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,secret) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.name,a.email,a.username,a.imap_host,a.imap_port,a.smtp_host,a.smtp_port,a.smtp_starttls,a.color,secret])?;
+        self.db.execute("INSERT INTO accounts(id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,secret,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.name,a.email,a.username,a.imap_host,a.imap_port,a.smtp_host,a.smtp_port,a.smtp_starttls,a.color,secret,a.signature])?;
         self.db.execute("INSERT OR IGNORE INTO folders(account_id,name,label,kind) VALUES(?,'INBOX','INBOX','inbox')",[&a.id])?;
         Ok(a)
     }
@@ -163,7 +177,7 @@ impl Store {
         if input.password.contains(['\r','\n']) {bail!("Invalid credential characters")}
         let name=if input.name.trim().is_empty(){old.email.clone()}else{input.name.trim().to_string()};
         let secret=if input.password.is_empty(){None}else{Some(encrypt(&self.key,id,&input.password)?)};
-        self.db.execute("UPDATE accounts SET name=?,smtp_host=?,smtp_port=?,smtp_starttls=?,color=?,secret=coalesce(?,secret) WHERE id=?",params![name,input.smtp_host,input.smtp_port,input.smtp_starttls,input.color,secret,id])?;
+        self.db.execute("UPDATE accounts SET name=?,smtp_host=?,smtp_port=?,smtp_starttls=?,color=?,secret=coalesce(?,secret),signature=? WHERE id=?",params![name,input.smtp_host,input.smtp_port,input.smtp_starttls,input.color,secret,input.signature,id])?;
         self.account(id)
     }
     pub fn folders(&self)->Result<Vec<Folder>>{
@@ -249,7 +263,29 @@ impl Store {
         Ok(result)
     }
     pub fn message(&self,id:i64)->Result<Mail>{
-        Ok(self.db.query_row(&format!("SELECT {SUMMARY_COLUMNS},body,html_only,recipients FROM messages WHERE id=?"),[id],|r|Ok(Mail{summary:summary_row(r)?,body:r.get(8)?,html_only:r.get(9)?,recipients:r.get(10)?}))?)
+        let (summary,mut body,html_only,recipients,raw):(Summary,String,bool,String,Vec<u8>)=self.db.query_row(&format!("SELECT {SUMMARY_COLUMNS},body,html_only,recipients,raw FROM messages WHERE id=?"),[id],|r|Ok((summary_row(r)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)))?;
+        let mut html=None;let mut attachments=Vec::new();
+        if let Ok(parsed)=mailparse::parse_mail(&raw){
+            html=mime::body_part(&parsed,"text/html").map(|s|mime::sanitize_html(&s));
+            if body.is_empty(){if let Some(h)=&html{body=mime::plain_from_html(h)}}
+            for (i,part) in mime::attachment_parts(&parsed).iter().enumerate(){
+                if let Ok(info)=mime::metadata(part,i){attachments.push(info)}
+            }
+        }
+        Ok(Mail{summary,body,html_only,recipients,html,attachments})
+    }
+    fn with_attachment<T>(&self,id:i64,index:usize,action:impl FnOnce(&ParsedMail<'_>)->Result<T>)->Result<T>{
+        let raw:Vec<u8>=self.db.query_row("SELECT raw FROM messages WHERE id=?",[id],|r|r.get(0))?;
+        let parsed=mailparse::parse_mail(&raw).context("Cannot decode original MIME")?;
+        let parts=mime::attachment_parts(&parsed);
+        let part=parts.get(index).ok_or_else(||anyhow!("Attachment no longer exists"))?;
+        action(part)
+    }
+    pub fn attachment_preview(&self,id:i64,index:usize)->Result<AttachmentPreview>{
+        self.with_attachment(id,index,|p|mime::preview(p,index))
+    }
+    pub fn attachment_download(&self,id:i64,index:usize)->Result<(String,Vec<u8>)>{
+        self.with_attachment(id,index,|p|Ok((mime::attachment_name(p,index),mime::attachment_bytes(p)?)))
     }
     fn message_location(&self,id:i64)->Result<(String,String,u32,u32)>{
         Ok(self.db.query_row("SELECT account_id,folder,uid_validity,uid FROM messages WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?)
@@ -293,13 +329,20 @@ impl Store {
         let _=session.logout();Ok(())
     }
     pub fn drafts(&self)->Result<Vec<Draft>>{
-        let mut q=self.db.prepare("SELECT id,updated_at,account_id,recipients,cc,bcc,subject,body,in_reply_to,refs FROM drafts ORDER BY updated_at DESC,id DESC")?;
-        let rows=q.query_map([],|r|Ok(Draft{id:r.get(0)?,updated_at:r.get(1)?,mail:Compose{account_id:r.get(2)?,to:r.get(3)?,cc:r.get(4)?,bcc:r.get(5)?,subject:r.get(6)?,body:r.get(7)?,in_reply_to:r.get(8)?,references:r.get(9)?}}))?.collect::<rusqlite::Result<Vec<_>>>()?;Ok(rows)
+        let mut q=self.db.prepare("SELECT id,updated_at,account_id,recipients,cc,bcc,subject,body,in_reply_to,refs,html,save_sent_copy FROM drafts ORDER BY updated_at DESC,id DESC")?;
+        let rows=q.query_map([],|r|Ok(Draft{id:r.get(0)?,updated_at:r.get(1)?,mail:Compose{account_id:r.get(2)?,to:r.get(3)?,cc:r.get(4)?,bcc:r.get(5)?,subject:r.get(6)?,body:r.get(7)?,in_reply_to:r.get(8)?,references:r.get(9)?,html:r.get(10)?,attachments:Vec::new(),save_sent_copy:r.get(11)?}}))?.collect::<rusqlite::Result<Vec<_>>>()?;Ok(rows)
+    }
+    pub fn draft(&self,id:&str)->Result<Draft>{
+        let (mut draft,data)=self.db.query_row("SELECT id,updated_at,account_id,recipients,cc,bcc,subject,body,in_reply_to,refs,html,save_sent_copy,attachments FROM drafts WHERE id=?",[id],|r|Ok((Draft{id:r.get(0)?,updated_at:r.get(1)?,mail:Compose{account_id:r.get(2)?,to:r.get(3)?,cc:r.get(4)?,bcc:r.get(5)?,subject:r.get(6)?,body:r.get(7)?,in_reply_to:r.get(8)?,references:r.get(9)?,html:r.get(10)?,attachments:Vec::new(),save_sent_copy:r.get(11)?}},r.get::<_,String>(12)?)))?;
+        draft.mail.attachments=serde_json::from_str(&data).context("Cannot decode saved draft attachments")?;
+        Ok(draft)
     }
     pub fn save_draft(&self,id:Option<String>,mail:Compose)->Result<String>{
         self.account(&mail.account_id)?;
         let id=match id{Some(id)=>{Uuid::parse_str(&id).context("Invalid draft ID")?;id},None=>Uuid::new_v4().to_string()};
-        self.db.execute("INSERT INTO drafts(id,account_id,recipients,cc,bcc,subject,body,updated_at,in_reply_to,refs) VALUES(?,?,?,?,?,?,?,unixepoch(),?,?) ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,recipients=excluded.recipients,cc=excluded.cc,bcc=excluded.bcc,subject=excluded.subject,body=excluded.body,updated_at=excluded.updated_at,in_reply_to=excluded.in_reply_to,refs=excluded.refs",params![id,mail.account_id,mail.to,mail.cc,mail.bcc,mail.subject,mail.body,mail.in_reply_to,mail.references])?;
+        let attachments=serde_json::to_string(&mail.attachments)?;
+        let html=mail.html.map(|s|mime::sanitize_html(&s));
+        self.db.execute("INSERT INTO drafts(id,account_id,recipients,cc,bcc,subject,body,updated_at,in_reply_to,refs,html,attachments,save_sent_copy) VALUES(?,?,?,?,?,?,?,unixepoch(),?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,recipients=excluded.recipients,cc=excluded.cc,bcc=excluded.bcc,subject=excluded.subject,body=excluded.body,updated_at=excluded.updated_at,in_reply_to=excluded.in_reply_to,refs=excluded.refs,html=excluded.html,attachments=excluded.attachments,save_sent_copy=excluded.save_sent_copy",params![id,mail.account_id,mail.to,mail.cc,mail.bcc,mail.subject,mail.body,mail.in_reply_to,mail.references,html,attachments,mail.save_sent_copy])?;
         Ok(id)
     }
     pub fn delete_draft(&self,id:&str)->Result<()>{self.db.execute("DELETE FROM drafts WHERE id=?",[id])?;Ok(())}
@@ -332,9 +375,10 @@ impl Store {
             let previous=h.get_first_value("References").filter(|s|valid_message_ids(s)).or_else(||h.get_first_value("In-Reply-To").filter(|s|valid_message_ids(s))).unwrap_or_default();
             if previous.is_empty(){mid.clone()}else{format!("{previous} {mid}")}
         });
-        Ok(Compose{account_id:account.id,to,cc,bcc:String::new(),subject,body:quoted,in_reply_to:message_id,references})
+        let attachments=if forward{mime::attachment_parts(&parsed).iter().enumerate().map(|(i,p)|mime::outgoing(p,i)).collect::<Result<Vec<_>>>()?}else{Vec::new()};
+        Ok(Compose{account_id:account.id,to,cc,bcc:String::new(),subject,body:quoted,in_reply_to:message_id,references,html:None,attachments,save_sent_copy:false})
     }
-    pub fn send(&self,mail:Compose)->Result<()>{
+    pub fn send(&self,mail:Compose)->Result<SendReport>{
         let a=self.account(&mail.account_id)?;let pw=self.password(&a.id)?;
         let mut builder=Message::builder().from(a.email.parse().map_err(|_|anyhow!("Invalid sender address"))?).subject(mail.subject);
         let recipients=addresses(&mail.to)?;
@@ -344,9 +388,22 @@ impl Store {
         for recipient in recipients{builder=builder.to(recipient)}
         for recipient in addresses(&mail.cc)?{builder=builder.cc(recipient)}
         for recipient in addresses(&mail.bcc)?{builder=builder.bcc(recipient)}
-        let message=builder.header(ContentType::TEXT_PLAIN).body(mail.body).context("Cannot construct message")?;
+        let message=mime::build_message(builder,mail.body,mail.html,mail.attachments).context("Cannot construct message")?;
         smtp(&a,&pw)?.send(&message).map_err(|_|anyhow!("SMTP send failed or delivery status is uncertain; check server before retrying"))?;
-        Ok(())
+        // SMTP accepted is authoritative even if the optional IMAP sent-copy fails.
+        let sent_copy=if mail.save_sent_copy {
+            match self.append_sent(&a,&pw,&message){Ok(())=>"saved",Err(_)=>"failed_or_uncertain"}
+        }else{"not_requested"};
+        Ok(SendReport{sent_copy:sent_copy.into()})
+    }
+    fn append_sent(&self,a:&Account,pw:&str,message:&Message)->Result<()>{
+        let mut session=connect_imap(a,pw)?;
+        let folders=discover(&mut session)?;
+        let sent=folders.iter().find(|f|f.2=="sent").ok_or_else(||anyhow!("Server does not declare a Sent folder"))?;
+        // imap 2.4.1 APPEND does not escape mailbox names internally.
+        if sent.0.contains(['"','\\','\r','\n']){bail!("Unsupported Sent mailbox wire name")}
+        session.append_with_flags(&sent.0,message.formatted(),&[imap::types::Flag::Seen]).context("Sent copy append failed")?;
+        let _=session.logout();Ok(())
     }
 }
 
@@ -427,12 +484,8 @@ fn smtp(a:&Account,pw:&str)->Result<SmtpTransport>{
 }
 #[derive(Default)]
 struct Parsed { sender:String,recipients:String,subject:String,timestamp:i64,body:String,html_only:bool }
-fn text_part(mail:&ParsedMail<'_>)->Option<String>{
-    if mail.get_headers().get_first_value("Content-Disposition").is_some_and(|s|s.to_lowercase().starts_with("attachment")){return None}
-    if mail.ctype.mimetype.eq_ignore_ascii_case("text/plain"){return mail.get_body().ok()}
-    mail.subparts.iter().find_map(text_part)
-}
-fn has_html(mail:&ParsedMail<'_>)->bool{mail.ctype.mimetype.eq_ignore_ascii_case("text/html")||mail.subparts.iter().any(has_html)}
+fn text_part(mail:&ParsedMail<'_>)->Option<String>{mime::body_part(mail,"text/plain")}
+fn has_html(mail:&ParsedMail<'_>)->bool{mime::body_part(mail,"text/html").is_some()}
 fn parse(raw:&[u8])->Parsed{
     let Ok(mail)=mailparse::parse_mail(raw)else{return Parsed{body:"Unable to decode this message. Original MIME cached.".into(),..Default::default()}};
     let headers=mail.get_headers();let body=text_part(&mail);
@@ -442,7 +495,7 @@ fn parse(raw:&[u8])->Parsed{
 #[cfg(test)]
 mod tests{
     use super::*;
-    fn input()->NewAccount{NewAccount{name:"Test".into(),email:"test@example.org".into(),username:"test@example.org".into(),password:"test-only-secret".into(),imap_host:"imap.example.org".into(),imap_port:993,smtp_host:"smtp.example.org".into(),smtp_port:465,smtp_starttls:false,color:"#123456".into()}}
+    fn input()->NewAccount{NewAccount{name:"Test".into(),email:"test@example.org".into(),username:"test@example.org".into(),password:"test-only-secret".into(),imap_host:"imap.example.org".into(),imap_port:993,smtp_host:"smtp.example.org".into(),smtp_port:465,smtp_starttls:false,color:"#123456".into(),signature:"Signature".into()}}
     #[test] fn credential_roundtrip_and_tamper(){
         let key=[42u8;32];let x=encrypt(&key,"a","secret").unwrap();let y=encrypt(&key,"a","secret").unwrap();
         assert_ne!(x,y);assert_eq!(decrypt(&key,"a",&x).unwrap(),"secret");assert!(decrypt(&key,"b",&x).is_err());
@@ -465,9 +518,11 @@ mod tests{
         assert_eq!(db.messages(None,Some("INBOX".into()),false,false,"",0).unwrap().len(),1);
         assert_eq!(db.messages(None,None,false,true,"",0).unwrap().len(),1);
         assert_eq!(db.messages(None,None,false,false,"",0).unwrap().len(),2);
-        let m=Compose{account_id:a.id.clone(),to:"".into(),cc:"".into(),bcc:"".into(),subject:"draft".into(),body:"first".into(),in_reply_to:None,references:None};
+        let m=Compose{account_id:a.id.clone(),to:"".into(),cc:"".into(),bcc:"".into(),subject:"draft".into(),body:"first".into(),in_reply_to:None,references:None,html:None,attachments:Vec::new(),save_sent_copy:false};
         let id=db.save_draft(None,m.clone()).unwrap();let mut m=m;m.body="updated".into();db.save_draft(Some(id.clone()),m).unwrap();
         assert_eq!(db.drafts().unwrap()[0].mail.body,"updated");
+        assert_eq!(db.draft(&id).unwrap().mail.body,"updated");
+        assert_eq!(db.accounts().unwrap()[0].signature,"Signature");
         db.delete_draft(&id).unwrap();assert!(db.drafts().unwrap().is_empty());
         assert_eq!(decode_mailbox("&ZeVnLIqe-"),"日本語");
         assert_eq!(decode_mailbox("A&-B"),"A&B");
