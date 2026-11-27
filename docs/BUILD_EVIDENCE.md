@@ -13,3 +13,11 @@
 
 ## Not yet verified
 Native Tauri desktop build/runtime (GTK/WebKitGTK dependencies not present on the build host), real provider compatibility, large mail performance, certificate rejection fixtures, native notifications, production installers. No actual mailbox connected or external message sent. No Release.
+
+## M3 MIME, attachments and compose — 2026-11-27
+
+- `300b0ea3a35a851dc92fc6cc96a9881bb272460e`: Guangzhou Linux checkout, `npm run build` passed (vue-tsc and Vite 6.4.6; 16 modules, JS 109.22 kB, CSS 11.09 kB).
+- Tokyo Linux, Rust 1.100.0, isolated matching system OpenSSL headers: initial MIME attachment unit test exposed a trailing CRLF introduced by automatic transfer encoding. Corrected by explicit Base64 attachment body in `f268d01327b4bd5cab37e8debb3a4cb3dcde1616`. Rebuilt: 6 unit tests passed, including strict HTML sanitization and attachment roundtrip. Existing TLS fixture passed.
+- `bdc93cfa9800e472612360f3c6398cd7bf607f75`: extended `python3 scripts/protocol-fixture.py` passed (1 integration test, 2.18 s). Inbound safe HTML, text attachment metadata/preview/exact bytes, forwarded attachment, saved draft reopen, rich multipart SMTP, exact binary payload (including NUL/0xff/line endings), opt-in Sent APPEND, sent-folder sync and absence of Bcc headers in SMTP and stored MIME all verified. Fixture tolerates MIME boundary whitespace in HTML.
+- Updated core Cargo.lock with ammonia 4.2.5, html-escape 0.2.15 and serde_json 1.0.154 resolved on the build host.
+- Native Tauri compilation/runtime, native save dialog and interactive editor behavior have not been tested; GTK/WebKitGTK environment still missing. No actual provider or external message used. No Release. Old imap-proto future-incompatibility warning remains.

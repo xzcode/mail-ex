@@ -6,7 +6,7 @@ Local-first, open-source desktop email client for Windows, macOS and Linux.
 
 ## Development status
 
-Development baseline, not a production release. The code includes password/app-code TLS IMAP/SMTP, SQLite cache, unified inbox, folder discovery and synchronization, starred/read status, server-side UID MOVE, account editing, local drafts, plain-text compose, reply/reply-all/forward and optional inbox polling while open. Provider compatibility and real mailbox integration still require validation. OAuth, safe HTML rendering, attachments, robust background scheduling/IDLE, notifications and sent-folder APPEND are not yet complete.
+Development baseline, not a production release. The code includes password/app-code TLS IMAP/SMTP, SQLite cache, unified inbox, folder sync, starred/read status, UID MOVE, account editing, safe HTML/plain reading, attachment preview/save/compose/forward, basic rich text, per-account signatures, local drafts with autosave, replies, optional server Sent copy and opt-in inbox polling while open. Frontend/core builds, six core tests and a loopback TLS integration test passed. Native desktop UI and provider compatibility remain unverified. OAuth, independent native windows, attachment streaming and robust background synchronization/notifications are pending.
 
 ## Development
 
@@ -23,7 +23,7 @@ To build a native package on the target OS: `npm run tauri build`. No Mail EX se
 
 ## Security notes
 
-No remote HTML or images are rendered. Credentials are encrypted using a per-install key stored locally next to the database; this is not full database encryption. Move is permitted only if the server advertises IMAP MOVE. No blanket EXPUNGE or insecure fallback. Do not connect an important mailbox until integration and security validation are complete.
+Only strictly sanitized HTML is rendered; remote images and all HTML attributes are stripped. Credentials are encrypted using a per-install key stored locally next to the database; this is not full database encryption. Move is permitted only if the server advertises IMAP MOVE. No blanket EXPUNGE or insecure fallback. Do not connect an important mailbox until integration and security validation are complete.
 
 ## License
 

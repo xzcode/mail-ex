@@ -3,8 +3,8 @@
 - M0: product specification, design, architecture and project setup — baseline established.
 - M1: multi-account, TLS IMAP/SMTP, manual sync, SQLite, unified inbox, desktop UI, plain text compose, read/unread — core and frontend build passed, loopback protocol verification passed; native desktop and actual providers still pending.
 - M2: folder discovery, per-folder/all-folder sync, unified inbox/starred/all, flags, UID MOVE, opt-in polling and account editing — implemented; covered core functions passed fixture. Remaining: real provider acceptance, incremental checkpoints/IDLE, cancellable jobs, virtual list, native notification, non-MOVE safe strategy and folder CRUD.
-- M3: local multi-draft store, reply/reply all/forward and reply headers — implemented, reply/drafts passed fixture. Remaining: safe HTML, rich editor, attachment streaming/download and forwarding, signatures, independent windows, sent-folder APPEND.
-- M4: OAuth PKCE, Gmail and Microsoft Graph/IMAP OAuth, token refresh and provider tests.
+- M3: strict safe HTML/plain text reading, attachment metadata/preview/save/upload/forward, rich text editing, per-account signature, local drafts with payload and autosave, reply/forward, opt-in server Sent APPEND — source implemented; frontend build, MIME unit tests, extended TLS protocol fixture passed. Remaining: native save dialog and interactive editor acceptance, independent native windows, streaming/large attachment optimization, inline CID images, richer HTML formatting and PDF preview.
+- M4: OAuth PKCE, Gmail and Microsoft Graph/IMAP OAuth, token refresh and provider tests — next milestone; not implemented.
 - M5: FTS5 index, advanced search, rules, grouping and batch operations.
 - M6: contacts, templates, outbox, scheduled send, notifications.
 - M7: import/export, backup/restore, security audit, storage settings/cleanup.
@@ -12,4 +12,4 @@
 - M9: polish, accessibility, themes and languages, OS integrations, packages and releases.
 - M10: optional self-hosted sync, mobile and opt-in AI.
 
-See [M2/M3 notes](M2_M3.md) and [build evidence](BUILD_EVIDENCE.md). Never equate loopback verification with provider or native desktop acceptance.
+See [M2/M3 notes](M2_M3.md), [M3 MIME notes](M3_MIME.md) and [build evidence](BUILD_EVIDENCE.md). Never equate loopback verification with provider or native desktop acceptance.
