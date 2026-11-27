@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+*.sqlite3
+*.sqlite3-*
+vault.key
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
