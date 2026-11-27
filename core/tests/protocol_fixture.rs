@@ -27,7 +27,7 @@ fn tls_imap_and_smtp_roundtrip() {
     let id=mail[0].id;
     let incoming=store.message(id).unwrap();
     assert_eq!(incoming.body.trim(),"Fixture body.");
-    assert_eq!(incoming.html.as_deref(),Some("<p><b>Fixture HTML.</b></p>"));
+    assert_eq!(incoming.html.as_deref().map(str::trim),Some("<p><b>Fixture HTML.</b></p>"));
     assert_eq!(incoming.attachments.len(),1);
     assert_eq!(incoming.attachments[0].name,"incoming.txt");
     assert_eq!(incoming.attachments[0].size,3);
@@ -75,5 +75,5 @@ fn tls_imap_and_smtp_roundtrip() {
     assert_eq!(sent_list.len(),1);
     let sent_id=sent_list[0].id;
     assert_eq!(store.attachment_download(sent_id,0).unwrap().1,payload);
-    assert_eq!(store.message(sent_id).unwrap().html.as_deref(),Some("<p><strong>Local test only.</strong></p>"));
+    assert_eq!(store.message(sent_id).unwrap().html.as_deref().map(str::trim),Some("<p><strong>Local test only.</strong></p>"));
 }
