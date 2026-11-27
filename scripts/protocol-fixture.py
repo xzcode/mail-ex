@@ -2,6 +2,8 @@
 """Loopback-only IMAP/SMTP fixture, with a temporary trusted CA. Linux/OpenSSL."""
 import argparse
 import base64
+from email import policy
+from email.parser import BytesParser
 import os
 from pathlib import Path
 import re
@@ -18,7 +20,17 @@ RAW = (b"From: Sender <sender@example.invalid>\r\n"
        b"Subject: Fixture message\r\n"
        b"Date: Fri, 27 Nov 2026 00:00:00 +0000\r\n"
        b"Message-ID: <fixture-1@example.invalid>\r\n"
-       b"Content-Type: text/plain; charset=utf-8\r\n\r\nFixture body.\r\n")
+       b"MIME-Version: 1.0\r\n"
+       b"Content-Type: multipart/mixed; boundary=fixture-mixed\r\n\r\n"
+       b"--fixture-mixed\r\nContent-Type: multipart/alternative; boundary=fixture-alt\r\n\r\n"
+       b"--fixture-alt\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nFixture body.\r\n"
+       b"--fixture-alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+       b"<p><b>Fixture HTML.</b><img src='https://tracker.invalid/a'></p>\r\n"
+       b"--fixture-alt--\r\n"
+       b"--fixture-mixed\r\nContent-Type: text/plain\r\n"
+       b"Content-Disposition: attachment; filename=incoming.txt\r\n"
+       b"Content-Transfer-Encoding: base64\r\n\r\nYWJj\r\n"
+       b"--fixture-mixed--\r\n")
 MAILBOXES = {"INBOX": {1: {"raw": RAW, "flags": set()}},
              "Sent": {}, "Archive": {}, "Trash": {}}
 ROLES = {"INBOX": "\\HasNoChildren", "Sent": "\\Sent",
@@ -82,6 +94,20 @@ class IMAP(Handler):
                         self.line("* OK [UIDNEXT 20] Next UID")
                         self.line(f"{tag} OK [{'READ-ONLY' if cmd == 'EXAMINE' else 'READ-WRITE'}] Selected")
                         continue
+                elif cmd == "APPEND" and args:
+                    name = args[0]
+                    literal = re.search(rb"\{(\d+)\}\r\n$", raw)
+                    if name != "Sent" or not literal:
+                        ok = False
+                    else:
+                        self.line("+ Send literal")
+                        size = int(literal.group(1))
+                        message = self.rfile.read(size)
+                        terminator = self.rfile.readline()
+                        if len(message) != size or terminator != b"\r\n":
+                            ok = False
+                        else:
+                            MAILBOXES[name][12] = {"raw": message, "flags": {"\\Seen"}}
                 elif cmd == "UID" and args:
                     op = args[0].upper()
                     box = MAILBOXES[selected]
@@ -233,9 +259,20 @@ def run():
                 recipients, payload = DELIVERIES[0]
                 assert any("receiver@example.invalid" in r for r in recipients)
                 assert any("hidden@example.invalid" in r for r in recipients)
-                assert b"Local test only." in payload
                 assert not re.search(rb"(?im)^Bcc:", payload), "Bcc leaked into MIME headers"
-                print("Local TLS IMAP/SMTP, mailbox MOVE, flags, reply, draft and Bcc fixture passed.")
+                assert len(MAILBOXES["Sent"]) == 1, "Expected one optional IMAP APPEND"
+                sent_payload = MAILBOXES["Sent"][12]["raw"]
+                for data in (payload, sent_payload):
+                    msg = BytesParser(policy=policy.default).parsebytes(data)
+                    assert msg["Bcc"] is None, "Bcc leaked into a stored MIME header"
+                    assert msg.get_body(preferencelist=("plain",)).get_content().strip() == "Local test only."
+                    html = msg.get_body(preferencelist=("html",)).get_content()
+                    assert "<strong>Local test only.</strong>" in html and "tracker.invalid" not in html
+                    attachments = list(msg.iter_attachments())
+                    assert len(attachments) == 1
+                    assert attachments[0].get_filename() == "fixture.bin"
+                    assert attachments[0].get_payload(decode=True) == b"\x00\xffABC\n\r\n"
+                print("Local TLS IMAP/SMTP, safe HTML, byte-exact MIME attachments, APPEND, MOVE, flags, draft and Bcc fixture passed.")
             finally:
                 imap.shutdown()
                 smtp.shutdown()
