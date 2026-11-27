@@ -22,6 +22,9 @@ const separateCompose=ref(localStorage.getItem('separateCompose')!=='off')
 const density=ref(localStorage.getItem('density')||'comfortable')
 const readerFontSize=ref(Number(localStorage.getItem('readerFontSize')||14))
 const settingsPanel=ref(false)
+const closeToTray=ref(localStorage.getItem('closeToTray')==='on'),trayAvailable=ref(false)
+let unlistenTraySync:UnlistenFn|undefined,unlistenTrayQuit:UnlistenFn|undefined
+let closingMain=false
 const startupError=ref('')
 let allowClose=false
 let unlistenDrafts:UnlistenFn|undefined,unlistenClose:UnlistenFn|undefined
@@ -32,6 +35,7 @@ const autoMinutes=ref(Math.max(0,Number(localStorage.getItem('autoMinutes')||0)|
 const navWidth=ref(Number(localStorage.getItem('navWidth'))||234), listWidth=ref(Number(localStorage.getItem('listWidth'))||355)
 watch(language,v=>localStorage.setItem('language',v))
 watch(separateCompose,v=>localStorage.setItem('separateCompose',v?'on':'off'))
+watch(closeToTray,v=>localStorage.setItem('closeToTray',v?'on':'off'))
 watch(density,v=>localStorage.setItem('density',v))
 watch(readerFontSize,v=>localStorage.setItem('readerFontSize',String(v)))
 watch(theme,v=>localStorage.setItem('theme',v))
@@ -412,6 +416,21 @@ function preferenceChanged(e:StorageEvent){
   if(e.key==='autoMinutes')autoMinutes.value=Math.max(0,Number(e.newValue||0)||0)
   if(e.key==='draftAutosave')autosave.value=e.newValue!=='off'
 }
+async function requestDesktopClose(forceQuit=false){
+  if(detachedCompose||closingMain)return
+  if(!forceQuit&&closeToTray.value){
+    closingMain=true
+    try{await api.hideMainToTray()}catch(e){error.value=errorText(e);status.value=t('Window remains open. Use Quit in Settings to exit.','窗口保持打开；可在设置中选择退出。')}finally{closingMain=false}
+    return
+  }
+  if(busy.value||loading.value){error.value=t('Wait for the active operation before quitting.','当前操作尚未完成，请完成后退出。');return}
+  if(organizerTab.value||dataPanel.value||calendarPanel.value||dialog.value==='account'||dialog.value==='oauth'){
+    error.value=t('Close the current management or account dialog before quitting.','请先关闭当前管理或账号窗口再退出。');return
+  }
+  if(dialog.value==='compose'&&dirty.value&&!confirm(t('Quit without saving the latest draft changes?','退出且不保存草稿的最近修改？')))return
+  closingMain=true
+  try{await api.quitDesktop()}catch(e){error.value=errorText(e);closingMain=false}
+}
 function keyboard(e:KeyboardEvent){
   const mod=e.ctrlKey||e.metaKey
   if(e.repeat)return
@@ -441,6 +460,10 @@ onMounted(async()=>{
       })
     }else{
       await refreshDrafts();await refreshOutbox();await load()
+      trayAvailable.value=await api.trayAvailable()
+      unlistenClose=await getCurrentWindow().onCloseRequested(e=>{e.preventDefault();void requestDesktopClose()})
+      unlistenTraySync=await listen('tray-sync',()=>{if(!busy.value&&!dialog.value&&!settingsPanel.value&&!organizerTab.value&&!dataPanel.value&&!calendarPanel.value)void sync();else status.value=t('Close the active dialog or finish the operation before syncing.','请关闭当前对话框或完成操作后再同步。')})
+      unlistenTrayQuit=await listen('tray-quit',()=>{void requestDesktopClose(true)})
       unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})})
       unlistenDrafts=await listen('drafts-changed',()=>{void refreshDrafts().catch(e=>{error.value=errorText(e)})})
       unlistenReminder=await listen<number>('calendar-reminder',e=>{status.value=t('Calendar reminders: ','日程提醒：')+e.payload})
@@ -450,7 +473,7 @@ onMounted(async()=>{
   }catch(e){error.value=errorText(e);if(detachedCompose)startupError.value=error.value}
   draftTimer=window.setInterval(()=>{if(autosave.value&&dialog.value==='compose'&&dirty.value&&!busy.value)void run(()=>persistDraft(false))},5000)
 })
-onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.();unlistenReminder?.();unlistenDrafts?.();unlistenClose?.();window.removeEventListener('storage',preferenceChanged);window.removeEventListener('keydown',keyboard)})
+onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.();unlistenReminder?.();unlistenDrafts?.();unlistenClose?.();unlistenTraySync?.();unlistenTrayQuit?.();window.removeEventListener('storage',preferenceChanged);window.removeEventListener('keydown',keyboard)})
 </script>
 
 <template>
@@ -645,10 +668,12 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
         <label>{{t('Automatic inbox sync interval (minutes; 0 = manual)','自动同步间隔（分钟；0 为手动）')}}<input v-model.number="autoMinutes" type="number" min="0" step="1" @blur="autoMinutes=Math.max(0,Math.floor(Number(autoMinutes)||0))"></label>
         <label class="inline-label"><input type="checkbox" v-model="separateCompose">{{t('Open new compose in an independent window','默认使用独立邮件撰写窗口')}}</label>
         <label class="inline-label"><input type="checkbox" v-model="autosave">{{t('Automatically save drafts','自动保存草稿')}}</label>
+        <label class="inline-label"><input type="checkbox" v-model="closeToTray" :disabled="!trayAvailable">{{t('Closing the main window keeps Mail EX in the system tray','关闭主窗口后驻留系统托盘')}}</label>
+        <p class="hint">{{trayAvailable?t('The tray can reopen Mail EX, synchronize or quit. Linux requires a compatible status notifier host. Quit stops scheduled delivery until the next launch.','托盘可重新打开应用、同步或退出；Linux 需要支持状态通知器的桌面环境。退出后定时发送暂停至下次启动。'):t('System tray is unavailable in this desktop session.','当前桌面会话不支持系统托盘。')}}</p>
         <div class="organizer-action-row"><button @click="settingsPanel=false;dataPanel=true">{{t('Storage and backups','存储及备份')}}</button><button @click="settingsPanel=false;calendarPanel=true">{{t('Calendar and notifications','日历及通知')}}</button></div>
       </div>
       <div class="data-section"><h3>{{t('Keyboard shortcuts','快捷键')}}</h3><div class="shortcut-list"><span>{{t('New message','写邮件')}}</span><kbd>Ctrl / ⌘ + N</kbd><span>{{t('Search','搜索')}}</span><kbd>Ctrl / ⌘ + F</kbd><span>{{t('Synchronize','同步')}}</span><kbd>F5</kbd><span>{{t('Settings','设置')}}</span><kbd>Ctrl / ⌘ + ,</kbd><span>{{t('Save draft','保存草稿')}}</span><kbd>Ctrl / ⌘ + S</kbd></div></div>
-      <div class="modal-actions"><button class="primary" @click="settingsPanel=false">{{t('Done','完成')}}</button></div>
+      <div class="modal-actions"><button @click="settingsPanel=false;requestDesktopClose(true)">{{t('Quit Mail EX','退出 Mail EX')}}</button><button class="primary" @click="settingsPanel=false">{{t('Done','完成')}}</button></div>
     </section>
   </div>
   <CalendarPanel v-if="calendarPanel" :zh="zh" :accounts="accounts" :contacts="contacts" @close="calendarPanel=false" @compose="calendarPanel=false;handleCompose($event)"/>

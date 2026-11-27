@@ -113,6 +113,9 @@ export const api = {
   openReader: (id:number) => invoke<void>('open_reader_window',{id}),
   readerSnapshot: () => invoke<ReaderSnapshot>('reader_snapshot'),
   frontendReady: () => invoke<void>('frontend_ready'),
+  trayAvailable: () => invoke<boolean>('tray_available'),
+  hideMainToTray: () => invoke<void>('hide_main_to_tray'),
+  quitDesktop: () => invoke<void>('quit_desktop'),
   notificationEnabled: () => invoke<boolean>('notification_enabled'),
   setNotifications: (enabled:boolean) => invoke<void>('set_notifications',{enabled})
 }
