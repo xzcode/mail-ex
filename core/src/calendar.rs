@@ -132,7 +132,7 @@ fn event_from_lines(lines:&[String],header:&[String],zones:&[String],method:&str
 fn parse_ics(text:&str)->Result<Vec<ParsedEvent>>{
     let lines=unfold(text.trim_start_matches('\u{feff}'));
     if lines.iter().any(|l|l.chars().any(|c|c.is_control()&&c!='\t')){bail!("Invalid calendar content line")}
-    let mut result=Vec::new();let mut header=Vec::new();let mut zones=Vec::new();let mut events:Vec<Vec<String>>=Vec::new();
+    let mut result=Vec::new();let mut header:Vec<String>=Vec::new();let mut zones:Vec<String>=Vec::new();let mut events:Vec<Vec<String>>=Vec::new();
     let mut inside=false;let mut depth=0usize;let mut component=Vec::new();let mut method=String::new();
     for line in lines{
         let upper=line.to_ascii_uppercase();
@@ -397,6 +397,18 @@ mod tests{
         assert_eq!(store.import_calendar_file(&file).unwrap().added,1);assert_eq!(store.import_calendar_file(&file).unwrap().skipped,1);
         assert_eq!(store.calendar_events().unwrap().len(),2);
         store.delete_calendar_event(&event.id).unwrap();assert_eq!(store.calendar_events().unwrap().len(),1);
+    }
+    #[test]fn reminders_claim_once_and_opt_in(){
+        let d=tempfile::tempdir().unwrap();let mut store=Store::open(d.path()).unwrap();
+        let e=store.save_calendar_event(CalendarEvent{summary:"Reminder".into(),start:"2026-12-01T10:00:00Z".into(),end:"2026-12-01T11:00:00Z".into(),reminder_minutes:Some(10),..Default::default()}).unwrap();
+        let now=reminder_time(&e.start,false).unwrap()-300;
+        assert_eq!(store.claim_reminders(now).unwrap(),0);
+        store.set_notifications(true).unwrap();
+        assert_eq!(store.claim_reminders(now-600).unwrap(),0);
+        assert_eq!(store.claim_reminders(now).unwrap(),1);
+        assert_eq!(store.claim_reminders(now).unwrap(),0);
+        drop(store);let mut store=Store::open(d.path()).unwrap();
+        assert_eq!(store.claim_reminders(now).unwrap(),0);
     }
     #[test]fn caldav_report_and_invitation_mime(){
         let xml=format!(r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/calendar/1.ics</d:href><d:propstat><d:prop><c:calendar-data><![CDATA[{ICS}]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#);

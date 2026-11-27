@@ -20,7 +20,7 @@ function dayBounds(key:string){const [y,m,d]=key.split('-').map(Number);return {
 function containsDay(e:CalendarEvent,key:string){
   const b=dayBounds(key),start=localValue(e.start),end=localValue(e.end)
   if(e.all_day)return start<b.end&&end>b.start
-  return start.slice(0,10)<=key&&((end>b.start+'T00:00')||start.slice(0,10)===key)
+  return start.slice(0,10)<=key&&((end.slice(0,16)>b.start+'T00:00')||start.slice(0,10)===key)
 }
 const days=computed(()=>{
   const [y,m]=month.value.split('-').map(Number)

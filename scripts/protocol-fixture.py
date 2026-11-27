@@ -38,6 +38,24 @@ ROLES = {"INBOX": "\\HasNoChildren", "Sent": "\\Sent",
 DELIVERIES = []
 REJECTED = []
 LOCK = threading.Lock()
+POP_COMMANDS = []
+POP_UIDL_COUNT = 0
+CAL_REPORTS = 0
+ICS = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n"
+    "UID:fixture-meeting@example.invalid\r\nDTSTART:20261201T080000Z\r\n"
+    "DTEND:20261201T090000Z\r\nSUMMARY:Fixture meeting\r\n"
+    "ORGANIZER:mailto:host@example.invalid\r\nATTENDEE:mailto:fixture@example.invalid\r\n"
+    "SEQUENCE:1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+POP_RAW = (
+    b"From: Host <host@example.invalid>\r\nTo: fixture@example.invalid\r\n"
+    b"Subject: POP fixture invitation\r\nMIME-Version: 1.0\r\n"
+    b"Content-Type: multipart/mixed; boundary=pop-boundary\r\n\r\n"
+    b"--pop-boundary\r\nContent-Type: text/plain\r\n\r\n.dot fixture\r\n"
+    b"--pop-boundary\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n"
+    + ICS.encode("ascii") + b"--pop-boundary--\r\n"
+)
 
 class TLSFixture(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
@@ -227,6 +245,74 @@ class SMTP(Handler):
             else:
                 self.line("500 Unsupported fixture command")
 
+class POP3(Handler):
+    def handle(self):
+        global POP_UIDL_COUNT
+        self.line("+OK loopback POP3")
+        user_ok = False
+        auth = False
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                return
+            cmd, _, arg = line.decode("ascii").strip().partition(" ")
+            cmd = cmd.upper()
+            with LOCK:
+                POP_COMMANDS.append(cmd)
+                if cmd == "USER":
+                    user_ok = arg == "fixture@example.invalid"
+                    self.line("+OK" if user_ok else "-ERR")
+                elif cmd == "PASS":
+                    auth = user_ok and arg == "fixture-only-secret"
+                    self.line("+OK" if auth else "-ERR")
+                elif cmd == "UIDL" and auth:
+                    POP_UIDL_COUNT += 1
+                    self.line("+OK UIDL")
+                    if POP_UIDL_COUNT <= 3:
+                        self.line("1 stable-pop-uid")
+                    self.line(".")
+                elif cmd == "RETR" and auth and arg == "1":
+                    self.line("+OK message")
+                    for row in POP_RAW.splitlines(keepends=True):
+                        self.wfile.write((b"." if row.startswith(b".") else b"") + row)
+                    self.line(".")
+                elif cmd == "QUIT":
+                    self.line("+OK bye")
+                    return
+                else:
+                    self.line("-ERR unsupported fixture command")
+
+class CalDAV(Handler):
+    def handle(self):
+        global CAL_REPORTS
+        request = self.rfile.readline().decode("ascii").strip()
+        headers = {}
+        while True:
+            line = self.rfile.readline()
+            if line in (b"", b"\r\n"):
+                break
+            key, value = line.decode("ascii").split(":", 1)
+            headers[key.lower()] = value.strip()
+        body = self.rfile.read(int(headers.get("content-length", "0")))
+        expected = "Basic " + base64.b64encode(b"fixture@example.invalid:fixture-only-secret").decode("ascii")
+        valid = request.startswith("REPORT /calendar/ ") and headers.get("authorization") == expected and headers.get("depth") == "1" and b"calendar-query" in body and b"calendar-data" in body
+        with LOCK:
+            CAL_REPORTS += 1
+            status = "200 OK" if CAL_REPORTS == 1 else "404 Not Found"
+        if valid:
+            xml = (
+                '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+                '<d:response><d:href>/calendar/fixture.ics</d:href><d:propstat><d:prop>'
+                '<c:calendar-data><![CDATA[' + ICS + ']]></c:calendar-data></d:prop>'
+                '<d:status>HTTP/1.1 ' + status + '</d:status></d:propstat></d:response></d:multistatus>'
+            ).encode("utf-8")
+            code = "207 Multi-Status"
+        else:
+            xml = b"invalid fixture request"
+            code = "400 Bad Request"
+        self.wfile.write(("HTTP/1.1 " + code + "\r\nContent-Type: application/xml\r\nContent-Length: " + str(len(xml)) + "\r\nConnection: close\r\n\r\n").encode("ascii") + xml)
+        self.wfile.flush()
+
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vendored", action="store_true", help="Build native-tls with vendored OpenSSL")
@@ -247,13 +333,16 @@ def run():
                 "-CAcreateserial", "-days", "1", "-out", "server.crt", "-extfile", "extensions.cnf")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(path / "server.crt", path / "server.key")
-        with TLSFixture(IMAP, context) as imap, TLSFixture(SMTP, context) as smtp:
-            for server in (imap, smtp):
+        with TLSFixture(IMAP, context) as imap, TLSFixture(SMTP, context) as smtp, TLSFixture(POP3, context) as pop, TLSFixture(CalDAV, context) as cal:
+            for server in (imap, smtp, pop, cal):
                 threading.Thread(target=server.serve_forever, daemon=True).start()
             env = os.environ.copy()
             env.update(SSL_CERT_FILE=str(path / "ca.crt"),
                        MAIL_EX_FIXTURE_IMAP_PORT=str(imap.server_address[1]),
-                       MAIL_EX_FIXTURE_SMTP_PORT=str(smtp.server_address[1]))
+                       MAIL_EX_FIXTURE_SMTP_PORT=str(smtp.server_address[1]),
+                       MAIL_EX_FIXTURE_POP_PORT=str(pop.server_address[1]),
+                       MAIL_EX_FIXTURE_CAL_PORT=str(cal.server_address[1]),
+                       NO_PROXY="localhost,127.0.0.1", no_proxy="localhost,127.0.0.1")
             command = ["cargo", "test", "--manifest-path", str(ROOT / "core/Cargo.toml"),
                        "--test", "protocol_fixture"]
             if args.vendored:
@@ -261,9 +350,12 @@ def run():
             command.extend(["--", "--ignored", "--nocapture"])
             try:
                 subprocess.run(command, cwd=ROOT, env=env, check=True)
-                assert len(DELIVERIES) == 1, "Expected exactly one locally accepted SMTP message"
+                assert len(DELIVERIES) == 2, "Expected one IMAP-account delivery and one POP3-account delivery"
+                assert POP_COMMANDS.count("RETR") == 1 and "DELE" not in POP_COMMANDS, "POP3 must retrieve once and never delete"
+                assert CAL_REPORTS == 2, "Expected successful and incomplete CalDAV reports"
                 assert len(REJECTED) == 1, "Rejected outbox delivery must not automatically retry"
-                recipients, payload = DELIVERIES[0]
+                recipients, payload = next((r, p) for r, p in DELIVERIES if b"Subject: Fixture delivery" in p)
+                assert any(b"Subject: POP fixture sent" in p for _, p in DELIVERIES)
                 assert any("receiver@example.invalid" in r for r in recipients)
                 assert any("hidden@example.invalid" in r for r in recipients)
                 assert not re.search(rb"(?im)^Bcc:", payload), "Bcc leaked into MIME headers"
@@ -279,10 +371,12 @@ def run():
                     assert len(attachments) == 1
                     assert attachments[0].get_filename() == "fixture.bin"
                     assert attachments[0].get_payload(decode=True) == b"\x00\xffABC\n\r\n"
-                print("Local TLS IMAP/SMTP, safe HTML, byte-exact MIME attachments, APPEND, MOVE, flags, draft, Bcc and durable outbox fixture passed.")
+                print("Local TLS IMAP/SMTP, safe HTML, byte-exact MIME attachments, APPEND, MOVE, flags, draft, Bcc durable outbox, POP3 and CalDAV fixtures passed.")
             finally:
                 imap.shutdown()
                 smtp.shutdown()
+                pop.shutdown()
+                cal.shutdown()
 
 if __name__ == "__main__":
     run()

@@ -1,4 +1,4 @@
-use mail_ex_core::{Compose, NewAccount, Store, OutgoingAttachment};
+use mail_ex_core::{Compose, NewAccount, Store, OutgoingAttachment, NewCalendarSource, CalendarEvent};
 use base64::{engine::general_purpose::STANDARD,Engine};
 
 /// Run via scripts/protocol-fixture.py, which creates a private CA and two
@@ -113,4 +113,55 @@ fn tls_imap_and_smtp_roundtrip() {
     assert_eq!(report.succeeded,vec![archived_id]);
     store.sync_account(&account.id,Some("Trash".into()),false).unwrap();
     assert_eq!(store.messages(None,Some("Trash".into()),false,true,"Fixture message",0).unwrap().len(),1);
+}
+
+#[test]
+#[ignore = "requires the loopback TLS protocol fixture"]
+fn tls_pop3_and_caldav_roundtrip(){
+    let pop_port=std::env::var("MAIL_EX_FIXTURE_POP_PORT").unwrap().parse().unwrap();
+    let smtp_port=std::env::var("MAIL_EX_FIXTURE_SMTP_PORT").unwrap().parse().unwrap();
+    let cal_port=std::env::var("MAIL_EX_FIXTURE_CAL_PORT").unwrap();
+    let dir=tempfile::tempdir().unwrap();let mut store=Store::open(dir.path()).unwrap();
+    let account=store.add_pop_account(NewAccount{name:"POP fixture".into(),email:"fixture@example.invalid".into(),username:"fixture@example.invalid".into(),password:"fixture-only-secret".into(),imap_host:"localhost".into(),imap_port:pop_port,smtp_host:"localhost".into(),smtp_port,smtp_starttls:false,color:"#123456".into(),signature:String::new()}).unwrap();
+    assert_eq!(account.auth_kind,"pop3");
+    store.test_account(&account.id).unwrap();
+    assert_eq!(store.sync_account(&account.id,None,false).unwrap().added,1);
+    assert_eq!(store.sync_account(&account.id,None,false).unwrap().added,0);
+    assert_eq!(store.sync_account(&account.id,None,false).unwrap().added,0);
+    let list=store.messages(Some(account.id.clone()),Some("INBOX".into()),false,false,"",0).unwrap();
+    assert_eq!(list.len(),1);
+    let id=list[0].id;
+    assert!(store.message(id).unwrap().body.contains(".dot fixture"));
+    store.set_seen(id,true).unwrap();store.set_starred(id,true).unwrap();
+    assert!(store.message(id).unwrap().summary.seen&&store.message(id).unwrap().summary.starred);
+    assert!(store.move_message(id,"Sent").is_err());
+    assert_eq!(store.cache_preview(Some(account.id.clone()),None).unwrap().messages,0);
+    let invitations=store.message_invitations(id).unwrap();assert_eq!(invitations.len(),1);
+    assert_eq!(invitations[0].event.summary,"Fixture meeting");
+    assert_eq!(store.add_invitation(id,0).unwrap().added,1);
+    assert_eq!(store.add_invitation(id,0).unwrap().skipped,1);
+    for state in ["ACCEPTED","TENTATIVE","DECLINED"]{
+        let reply=store.invitation_reply(id,0,&account.id,state).unwrap();
+        assert_eq!(reply.to,"host@example.invalid");
+        assert!(reply.attachments[0].media_type.contains("method=REPLY"));
+        let raw=String::from_utf8(STANDARD.decode(&reply.attachments[0].data).unwrap()).unwrap();
+        assert!(raw.contains(&format!("PARTSTAT={state}:mailto:fixture@example.invalid")));
+        assert!(raw.contains("UID:fixture-meeting@example.invalid"));
+    }
+    let event=store.save_calendar_event(CalendarEvent{summary:"Local invite".into(),start:"2026-12-02T10:00:00Z".into(),end:"2026-12-02T11:00:00Z".into(),..Default::default()}).unwrap();
+    let invite=store.meeting_invitation(&event.id,&account.id,"guest@example.invalid").unwrap();
+    let raw=String::from_utf8(STANDARD.decode(&invite.attachments[0].data).unwrap()).unwrap();
+    assert!(raw.contains("METHOD:REQUEST")&&raw.contains("mailto:guest@example.invalid"));
+    let source=store.add_calendar_source(NewCalendarSource{name:"Calendar fixture".into(),url:format!("https://localhost:{cal_port}/calendar/"),username:"fixture@example.invalid".into(),password:"fixture-only-secret".into()}).unwrap();
+    let report=store.sync_calendar(&source.id).unwrap();assert_eq!(report.events,1);assert_eq!(report.resources,1);
+    let remote=store.calendar_events().unwrap().into_iter().find(|e|e.source_id.as_deref()==Some(&source.id)).unwrap();
+    assert_eq!(remote.summary,"Fixture meeting");
+    assert!(store.save_calendar_event(remote.clone()).is_err());
+    assert!(store.sync_calendar(&source.id).is_err());
+    assert!(store.calendar_events().unwrap().iter().any(|e|e.id==remote.id));
+    store.remove_calendar_source(&source.id).unwrap();
+    assert!(store.calendar_events().unwrap().iter().all(|e|e.source_id.is_none()));
+    let result=store.send(Compose{account_id:account.id.clone(),to:"pop-receiver@example.invalid".into(),cc:String::new(),bcc:String::new(),subject:"POP fixture sent".into(),body:"Loopback POP3 Sent copy".into(),in_reply_to:None,references:None,html:None,attachments:Vec::new(),save_sent_copy:true}).unwrap();
+    assert_eq!(result.sent_copy,"saved");
+    assert_eq!(store.messages(Some(account.id.clone()),Some("Sent".into()),false,false,"",0).unwrap().len(),1);
 }
