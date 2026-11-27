@@ -1,12 +1,14 @@
-# Handoff
+# Handoff — M2 / partial M3
 
-Repository: xzcode/mail-ex, master. M0 design, M1 implementation and M2/M3 baseline are in source. See M2_M3.md. Frontend production build passed on previous baseline; current revision requires rerun. Rust toolchain located on Tokyo host but baseline compile blocked by missing OpenSSL development package. Do not use real accounts or release until verification.
+Repository: xzcode/mail-ex, master. M0 design established. M1/M2 implementation baseline plus partial M3. Latest validation: frontend production build, Rust core build, 4 unit tests and 1 loopback TLS integration test passed. See BUILD_EVIDENCE.md. Core Cargo.lock and npm lockfile committed.
 
 Priorities:
-1. Build core and run unit tests on Linux; validate latest frontend. Add Cargo lockfiles after successful resolution, verify Tauri desktop on a supported build host.
-2. Run local TLS IMAP/SMTP fixture tests: cert validation, auth failures, modified UTF-7 and MIME, folder discovery, UIDVALIDITY rollover, flag confirmation, MOVE and uncertain send. No blanket EXPUNGE.
-3. Finish safe HTML preview, MIME attachment listing/download/upload and rich editor, drafts autosave, sent-folder APPEND, cancellation and status.
-4. OAuth PKCE and provider-specific app registration / token refresh.
-5. Cross-platform CI and release packaging. No fake provider claims or live emails sent as tests.
+1. Finish safe HTML preview and MIME attachment listing/download/upload, rich editor, signatures, autosave, sent-folder APPEND and independent compose/read windows.
+2. Build native Tauri desktop on supported OS with required GTK/WebKitGTK dependencies. Run actual desktop interaction and provider tests without sending real mail absent explicit user request. Add desktop Cargo.lock when native dependency resolution is verified.
+3. Improve synchronization: UID checkpoints/IDLE, cancellation, per-account scheduler, native notifications, safe folder CRUD. No blanket EXPUNGE.
+4. Add OAuth PKCE and provider-specific app registration/token refresh. Check imap-proto upgrade path for future Rust compatibility.
+5. Cross-platform CI and release packaging.
 
-Limitations: credentials encrypted with adjacent per-install key; local messages/drafts not encrypted. No full-disk access or remote HTML execution. Automatic sync is opt-in polling only while UI runs, not a durable background service.
+Test reproduction: npm ci && npm run build; cargo test --manifest-path core/Cargo.toml --locked; on Linux with openssl and Python 3, python3 scripts/protocol-fixture.py (loopback only).
+
+Limitations: credentials encrypted with adjacent per-install key; messages and drafts not encrypted. No remote HTML execution. Polling is opt-in and runs only while UI runs. IMAP MOVE support required for move; archive/trash roles from server. No actual provider or desktop runtime acceptance, no production installer.
