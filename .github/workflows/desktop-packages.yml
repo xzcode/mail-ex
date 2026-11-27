@@ -56,7 +56,15 @@ jobs:
           APPLE_SIGNING_IDENTITY: '-'
         run: |
           npm run tauri -- build --ci --bundles dmg
-          codesign --verify --deep --strict 'src-tauri/target/release/bundle/macos/Mail EX.app'
+          set -euo pipefail
+          dmg=$(find src-tauri/target/release/bundle/dmg -type f -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          hdiutil verify "$dmg"
+          mount_dir=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir" >/dev/null || true; rmdir "$mount_dir" || true' EXIT
+          codesign --verify --deep --strict "$mount_dir/Mail EX.app"
+          file "$mount_dir/Mail EX.app/Contents/MacOS/mail-ex"
       - name: Linux optimized startup
         if: runner.os == 'Linux'
         run: bash scripts/release-smoke.sh src-tauri/target/release/mail-ex
