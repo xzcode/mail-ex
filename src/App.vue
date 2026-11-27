@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment, type OAuthRequest, type BatchOperation, type SearchFilters } from './api'
+import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment, type OAuthRequest, type BatchOperation, type SearchFilters, type Contact, type MailTemplate, type SavedSearch, type LabelCount, type OutboxItem } from './api'
+import {listen,type UnlistenFn} from '@tauri-apps/api/event'
+import OrganizerPanel from './components/OrganizerPanel.vue'
+import RecipientField from './components/RecipientField.vue'
 import RichEditor from './components/RichEditor.vue'
 
-type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'
+type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'|'outbox'
+type OrganizerTab='contacts'|'templates'|'rules'|'searches'
 const zh=ref(localStorage.getItem('language')?localStorage.getItem('language')==='zh':navigator.language.toLowerCase().startsWith('zh'))
 const t=(en:string,cn:string)=>zh.value?cn:en
 const theme=ref(localStorage.getItem('theme')||'system')
@@ -16,6 +20,10 @@ watch(navWidth,v=>localStorage.setItem('navWidth',String(v)))
 watch(listWidth,v=>localStorage.setItem('listWidth',String(v)))
 const accounts=ref<Account[]>([]), folders=ref<Folder[]>([]), messages=ref<Summary[]>([]), drafts=ref<Draft[]>([])
 const selected=ref<Mail|null>(null), expanded=ref<string[]>([])
+const contacts=ref<Contact[]>([]),templates=ref<MailTemplate[]>([]),savedSearches=ref<SavedSearch[]>([]),labels=ref<LabelCount[]>([]),messageLabels=ref<string[]>([]),outbox=ref<OutboxItem[]>([])
+const organizerTab=ref<OrganizerTab|null>(null),activeSavedId=ref(''),templateChoice=ref(''),templateName=ref('')
+const scheduleEnabled=ref(false),scheduleAt=ref(''),deliveryRequestId=ref('')
+let unlistenOutbox:UnlistenFn|undefined
 const readMode=ref<'html'|'plain'>('html'), preview=ref<AttachmentPreview|null>(null)
 const accountId=ref<string|null>(null), mode=ref<View>('inbox'), folderName=ref('INBOX')
 const query=ref(''), offset=ref(0), more=ref(false), destination=ref('')
@@ -26,7 +34,7 @@ const oauthForm=ref<OAuthRequest>({provider:'google',client_id:'',desktop_client
 const oauthWaiting=ref(false),oauthCanceling=ref(false)
 const editingOAuth=computed(()=>!!editId.value&&accounts.value.find(a=>a.id===editId.value)?.auth_kind!=='password')
 const advanced=ref(false)
-const blankFilters=()=>({sender:'',recipient:'',subject:'',fromDate:'',toDate:''})
+const blankFilters=()=>({sender:'',recipient:'',subject:'',label:'',fromDate:'',toDate:''})
 const filters=ref(blankFilters()),appliedFilters=ref<SearchFilters>({sender:'',recipient:'',subject:'',since:null,until:null})
 const batchIds=ref<number[]>([]),batchDestination=ref('')
 const selectedRows=computed(()=>messages.value.filter(m=>batchIds.value.includes(m.id)))
@@ -44,7 +52,7 @@ function localDate(s:string,next=false):number|null{
 function applySearch(){
   const f=filters.value,since=localDate(f.fromDate),until=localDate(f.toDate,true)
   if(since!==null&&until!==null&&since>=until){error.value=t('Start date must not be after end date.','开始日期不能晚于结束日期。');return}
-  appliedFilters.value={sender:f.sender,recipient:f.recipient,subject:f.subject,since,until}
+  activeSavedId.value='';appliedFilters.value={sender:f.sender,recipient:f.recipient,subject:f.subject,label:f.label,since,until}
   void load()
 }
 function clearSearch(){query.value='';filters.value=blankFilters();applySearch()}
@@ -107,7 +115,48 @@ const selectedFolders=computed(()=>folders.value.filter(f=>f.account_id===select
 const archiveFolder=computed(()=>selectedFolders.value.find(f=>f.kind==='archive'))
 const trashFolder=computed(()=>selectedFolders.value.find(f=>f.kind==='trash'))
 const folderLabel=(f:Folder)=>f.kind==='inbox'?t('Inbox','收件箱'):f.kind==='sent'?t('Sent','已发送'):f.kind==='drafts'?t('Server drafts','服务器草稿'):f.kind==='trash'?t('Trash','废纸篓'):f.kind==='junk'?t('Junk','垃圾邮件'):f.kind==='archive'?t('Archive','归档'):f.label
-const title=computed(()=>mode.value==='folder'?(currentFolder.value?folderLabel(currentFolder.value):folderName.value):({inbox:t('All inboxes','全部收件箱'),unread:t('Unread inboxes','未读邮件'),starred:t('Starred','星标邮件'),all:t('All cached mail','全部本地邮件'),drafts:t('Local drafts','本地草稿')}[mode.value]))
+const title=computed(()=>savedSearches.value.find(s=>s.id===activeSavedId.value)?.name||appliedFilters.value.label||(mode.value==='folder'?(currentFolder.value?folderLabel(currentFolder.value):folderName.value):({inbox:t('All inboxes','全部收件箱'),unread:t('Unread inboxes','未读邮件'),starred:t('Starred','星标邮件'),all:t('All cached mail','全部本地邮件'),drafts:t('Local drafts','本地草稿'),outbox:t('Outbox','发件箱')}[mode.value])))
+const searchSeed=computed<SavedSearch>(()=>({id:'',name:'',account_id:['drafts','outbox'].includes(mode.value)?null:accountId.value,mode:['drafts','outbox'].includes(mode.value)?'all':mode.value,folder:folderName.value,query:['drafts','outbox'].includes(mode.value)?'':query.value,filters:['drafts','outbox'].includes(mode.value)?{sender:'',recipient:'',subject:'',label:'',since:null,until:null}:{...appliedFilters.value}}))
+const currentOutbox=computed(()=>outbox.value.filter(o=>!query.value||[o.subject,o.recipients,o.state].some(s=>s.toLowerCase().includes(query.value.toLowerCase()))))
+const pendingOutbox=computed(()=>outbox.value.filter(o=>o.state==='queued'||o.state==='sending').length)
+const outboxState=(o:OutboxItem)=>({queued:t('Queued','待发送'),sending:t('Sending / interrupted','发送中 / 可能中断'),accepted:t('SMTP accepted','SMTP 已接受'),uncertain:t('Uncertain','结果不确定'),canceled:t('Canceled','已取消')}[o.state])
+function dateInput(n:number|null,exclusive=false){if(n===null)return '';const d=new Date(n*1000-(exclusive?1:0));return [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-')}
+function useSavedSearch(search:SavedSearch){
+  organizerTab.value=null;activeSavedId.value=search.id;mode.value=search.mode as View;accountId.value=search.account_id;folderName.value=search.folder
+  query.value=search.query;appliedFilters.value={...search.filters};filters.value={sender:search.filters.sender,recipient:search.filters.recipient,subject:search.filters.subject,label:search.filters.label||'',fromDate:dateInput(search.filters.since),toDate:dateInput(search.filters.until,true)};advanced.value=false;void load()
+}
+function viewLabel(name:string){
+  activeSavedId.value='';mode.value='all';accountId.value=null;folderName.value='INBOX';query.value='';filters.value={...blankFilters(),label:name};appliedFilters.value={sender:'',recipient:'',subject:'',label:name,since:null,until:null};advanced.value=false;void load()
+}
+async function refreshOutbox(){outbox.value=await api.outbox()}
+async function refreshOrganizer(){
+  const [c,m,s,l]=await Promise.all([api.contacts(),api.templates(),api.searches(),api.labels()])
+  contacts.value=c;templates.value=m;savedSearches.value=s;labels.value=l
+}
+async function organizerChanged(){try{await refreshOrganizer();await load(true,true)}catch(e){error.value=errorText(e)}}
+function openOrganizer(tab:OrganizerTab){if(!busy.value)organizerTab.value=tab}
+function applyTemplate(){
+  const item=templates.value.find(x=>x.id===templateChoice.value);if(!item)return
+  if((draft.value.subject||draft.value.body)&&!confirm(t('Replace subject and body with this template? Recipients and attachments are kept.','使用模板替换主题和正文？收件人和附件将保留。')))return
+  draft.value.subject=item.subject;draft.value.body=item.body;draft.value.html=item.html
+}
+async function saveCurrentTemplate(){await run(async()=>{
+  await api.saveTemplate({id:'',name:templateName.value,subject:draft.value.subject,body:draft.value.body,html:draft.value.html??null})
+  templates.value=await api.templates();templateName.value='';status.value=t('Template saved.','模板已保存。')
+})}
+function newRequestId(){
+  if(typeof crypto.randomUUID==='function')return crypto.randomUUID()
+  const bytes=crypto.getRandomValues(new Uint8Array(16));bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128
+  const hex=Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20)
+}
+async function cancelQueued(o:OutboxItem){if(confirm(t('Cancel this queued message?','取消这封待发送邮件？')))await run(async()=>{await api.cancelOutbox(o.id);await refreshOutbox()})}
+async function resolveInterrupted(o:OutboxItem){if(confirm(t('Only continue if no other Mail EX instance is sending this message. Marking it uncertain does not resend it.','请确认没有其他 Mail EX 实例正在发送此邮件。标为不确定不会再次发送。')))await run(async()=>{await api.interruptOutbox(o.id);await refreshOutbox()})}
+async function copyQueued(o:OutboxItem){
+  if(o.state==='uncertain'&&!confirm(t('Verify whether the original message was delivered before creating another send request. Copy to a draft?','请先核对原邮件是否已经发送成功，再创建新的发送请求。复制为草稿？')))return
+  await run(async()=>{startCompose(await api.copyOutbox(o.id))})
+}
+async function removeQueued(o:OutboxItem){if(confirm(t('Delete this local outbox record? Server mail is unchanged.','删除此本地发件箱记录？服务器邮件不受影响。')))await run(async()=>{await api.deleteOutbox(o.id);await refreshOutbox()})}
+
 const currentDrafts=computed(()=>drafts.value.filter(d=>!query.value||[d.mail.subject,d.mail.to,d.mail.body].some(s=>s.toLowerCase().includes(query.value.toLowerCase()))))
 const totalUnread=computed(()=>folders.value.filter(f=>f.kind==='inbox').reduce((n,f)=>n+f.unread,0))
 const errorText=(e:unknown)=>typeof e==='string'?e:e instanceof Error?e.message:String(e)
@@ -120,13 +169,14 @@ async function refreshAccounts(){
   accounts.value=await api.accounts()
   expanded.value=expanded.value.filter(id=>accounts.value.some(a=>a.id===id))
   for(const a of accounts.value)if(!old.has(a.id))expanded.value.push(a.id)
-  folders.value=await api.folders()
+  folders.value=await api.folders();labels.value=await api.labels()
 }
 async function refreshDrafts(){drafts.value=await api.drafts()}
 async function load(reset=true,preserve=false){
   const token=++generation
   const previous=preserve?selected.value:null
-  if(reset){offset.value=0;selected.value=null;preview.value=null;batchIds.value=[];batchDestination.value='';detailGeneration++}
+  if(reset){offset.value=0;selected.value=null;messageLabels.value=[];preview.value=null;batchIds.value=[];batchDestination.value='';detailGeneration++}
+  if(mode.value==='outbox'){messages.value=[];more.value=false;loading.value=false;try{await refreshOutbox()}catch(e){error.value=errorText(e)}return}
   if(mode.value==='drafts'){messages.value=[];more.value=false;loading.value=false;try{await refreshDrafts()}catch(e){error.value=errorText(e)}return}
   loading.value=true
   try{
@@ -145,7 +195,7 @@ async function run(fn:()=>Promise<void>){
   try{await fn()}catch(e){error.value=errorText(e)}finally{busy.value=false}
 }
 function view(id:string|null,kind:View='inbox',folder='INBOX'){
-  accountId.value=id;mode.value=kind;folderName.value=folder;query.value='';filters.value=blankFilters();appliedFilters.value={sender:'',recipient:'',subject:'',since:null,until:null};advanced.value=false;void load()
+  activeSavedId.value='';accountId.value=id;mode.value=kind;folderName.value=folder;query.value='';filters.value=blankFilters();appliedFilters.value={sender:'',recipient:'',subject:'',since:null,until:null};advanced.value=false;void load()
 }
 function toggleExpand(id:string){
   expanded.value=expanded.value.includes(id)?expanded.value.filter(x=>x!==id):[...expanded.value,id]
@@ -186,8 +236,8 @@ async function sync(all=false,automatic=false){await run(async()=>{
   status.value=t('Synced folders: ','已同步文件夹：')+count+' · '+t('New cached messages: ','新增缓存邮件：')+total
   if(failures.length)error.value=failures.join('\n')
 })}
-async function remove(){const a=currentAccount.value;if(!a||!confirm(t('Remove this account and its local cache? Server mail is not deleted.','移除此账号及本地缓存？不会删除服务器邮件。')))return;await run(async()=>{await api.remove(a.id);await refreshAccounts();await refreshDrafts();view(null)})}
-async function open(m:Summary){const token=++detailGeneration;try{const result=await api.message(m.id);if(token===detailGeneration){selected.value=result;destination.value='';readMode.value=result.html!==null?'html':'plain';preview.value=null}}catch(e){if(token===detailGeneration)error.value=errorText(e)}}
+async function remove(){const a=currentAccount.value;if(!a||!confirm(t('Remove this account and its local cache? Server mail is not deleted.','移除此账号及本地缓存？不会删除服务器邮件。')))return;await run(async()=>{await api.remove(a.id);await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();view(null)})}
+async function open(m:Summary){const token=++detailGeneration;try{const [result,categories]=await Promise.all([api.message(m.id),api.messageLabels(m.id)]);if(token===detailGeneration){selected.value=result;messageLabels.value=categories;destination.value='';readMode.value=result.html!==null?'html':'plain';preview.value=null}}catch(e){if(token===detailGeneration)error.value=errorText(e)}}
 async function toggleSeen(){const m=selected.value;if(!m)return;await run(async()=>{await api.seen(m.id,!m.seen);await refreshAccounts();await load(true,true)})}
 async function toggleStar(){const m=selected.value;if(!m)return;await run(async()=>{await api.star(m.id,!m.starred);await load(true,true)})}
 async function moveTo(name:string){
@@ -203,7 +253,7 @@ async function moveTo(name:string){
 function escapeHtml(value:string){return value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/\r?\n/g,'<br>')}
 function startCompose(mail:Compose,id:string|null=null){
   draft.value={...mail,attachments:[...(mail.attachments||[])],html:mail.html??null,save_sent_copy:mail.save_sent_copy??false}
-  draftId.value=id;savedRevision.value=revision.value;dialog.value='compose';error.value=''
+  draftId.value=id;savedRevision.value=revision.value;dialog.value='compose';error.value='';templateChoice.value='';templateName.value='';scheduleEnabled.value=false;scheduleAt.value='';deliveryRequestId.value=newRequestId()
 }
 function compose(){
   if(busy.value)return
@@ -281,15 +331,28 @@ async function deleteDraft(d:Draft){
   if(!confirm(t('Delete this local draft?','删除这份本地草稿？')))return
   await run(async()=>{await api.deleteDraft(d.id);await refreshDrafts()})
 }
-async function send(){await run(async()=>{
-  const id=draftId.value
-  const report=await api.send({...draft.value,attachments:[...(draft.value.attachments||[])]})
-  dialog.value=null;draftId.value=null;draft.value=blankCompose();savedRevision.value=revision.value
-  status.value=t('Accepted by SMTP server.','SMTP 服务器已接受邮件。')
-  if(report.sent_copy==='saved')status.value+=' '+t('Sent copy saved to server.','已发送副本已保存。')
-  if(report.sent_copy==='failed_or_uncertain')error.value=t('Message accepted; sent-folder copy failed or is uncertain. Do not send again just to save a copy.','邮件已被接受，但已发送副本保存失败或结果不确定。请勿为保存副本重新发送。')
-  if(id){try{await api.deleteDraft(id);await refreshDrafts()}catch(e){error.value+=(error.value?'\n':'')+t('Message accepted; local draft cleanup failed: ','邮件已被接受，但本地草稿清理失败：')+errorText(e)}}
-})}
+async function send(){
+  let due=0
+  if(scheduleEnabled.value){
+    due=Math.floor(new Date(scheduleAt.value).getTime()/1000)
+    if(!Number.isFinite(due)||due<=Math.floor(Date.now()/1000)){error.value=t('Choose a future send time.','请选择未来的发送时间。');return}
+    if(!confirm(t('Queue this message for automatic delivery at the selected time while Mail EX is running?','将邮件加入队列，并在 Mail EX 运行期间于指定时间自动发送？')))return
+  }
+  await run(async()=>{
+    const id=deliveryRequestId.value
+    const item=await api.enqueue(id,{...draft.value,attachments:[...(draft.value.attachments||[])]},due,draftId.value)
+    dialog.value=null;draftId.value=null;draft.value=blankCompose();savedRevision.value=revision.value
+    await refreshDrafts();await refreshOutbox();view(null,'outbox')
+    status.value=due?t('Scheduled in the local outbox.','已加入本地定时发送队列。'):t('Queued for delivery.','已加入发件队列。')
+    if(!due&&item.state==='queued'){
+      const report=await api.dispatch(item.id)
+      if(report?.state==='accepted')status.value=t('Accepted by SMTP server.','SMTP 服务器已接受邮件。')
+      if(report?.state==='uncertain')error.value=t('Delivery is uncertain; verify before resending.','发送结果不确定，请核对后再发送。')
+      if(report?.sent_copy==='failed_or_uncertain')error.value=t('Message accepted; Sent copy failed or is uncertain. Do not send again just to save a copy.','邮件已被接受，但已发送副本保存失败或结果不确定。请勿为保存副本重新发送。')
+      await refreshOutbox()
+    }
+  })
+}
 function resize(event:PointerEvent,which:'nav'|'list'){
   event.preventDefault()
   const start=event.clientX,initial=which==='nav'?navWidth.value:listWidth.value
@@ -298,18 +361,18 @@ function resize(event:PointerEvent,which:'nav'|'list'){
   document.addEventListener('pointermove',move);document.addEventListener('pointerup',done);document.addEventListener('pointercancel',done)
 }
 onMounted(async()=>{
-  try{await refreshAccounts();await refreshDrafts();await load()}catch(e){error.value=errorText(e)}
-  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
+  try{await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();await load();unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})})}catch(e){error.value=errorText(e)}
+  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
   draftTimer=window.setInterval(()=>{if(autosave.value&&dialog.value==='compose'&&dirty.value&&!busy.value)void run(()=>persistDraft(false))},5000)
 })
-onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer)})
+onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.()})
 </script>
 
 <template>
 <div class="shell" :data-theme="theme">
   <header class="top">
     <div class="brand"><span class="logo">✉</span> Mail EX</div>
-    <form class="search" @submit.prevent="applySearch"><input v-model="query" :placeholder="t('Search subject, sender, recipient, body','搜索主题、发件人、收件人、正文')" :aria-label="t('Search','搜索')"><button>{{t('Search','搜索')}}</button><button v-if="mode!=='drafts'" type="button" :class="{active:advanced}" @click="advanced=!advanced">{{t('Filters','筛选')}}</button></form>
+    <form class="search" @submit.prevent="applySearch"><input v-model="query" :placeholder="t('Search subject, sender, recipient, body','搜索主题、发件人、收件人、正文')" :aria-label="t('Search','搜索')"><button>{{t('Search','搜索')}}</button><button v-if="mode!=='drafts'&&mode!=='outbox'" type="button" :class="{active:advanced}" @click="advanced=!advanced">{{t('Filters','筛选')}}</button></form>
     <div class="top-actions">
       <select v-model.number="autoMinutes" :aria-label="t('Automatic inbox sync','自动同步收件箱')" :title="t('Automatic inbox sync while open','应用运行时自动同步收件箱')"><option :value="0">{{t('Manual sync','手动同步')}}</option><option :value="1">{{t('Every 1 min','每 1 分钟')}}</option><option :value="5">{{t('Every 5 min','每 5 分钟')}}</option><option :value="15">{{t('Every 15 min','每 15 分钟')}}</option></select>
       <select v-model="theme" :aria-label="t('Theme','主题')"><option value="system">{{t('System','跟随系统')}}</option><option value="light">{{t('Light','浅色')}}</option><option value="dark">{{t('Dark','深色')}}</option></select><button @click="zh=!zh">{{zh?'EN':'中文'}}</button>
@@ -324,6 +387,14 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <button class="nav-row" :class="{active:mode==='starred'}" @click="view(null,'starred')">★ <span class="nav-label">{{t('Starred','星标邮件')}}</span></button>
       <button class="nav-row" :class="{active:mode==='all'}" @click="view(null,'all')">▧ <span class="nav-label">{{t('All cached mail','全部本地邮件')}}</span></button>
       <button class="nav-row" :class="{active:mode==='drafts'}" @click="view(null,'drafts')">✎ <span class="nav-label">{{t('Local drafts','本地草稿')}}</span><small v-if="drafts.length" class="count">{{drafts.length}}</small></button>
+      <button class="nav-row" :class="{active:mode==='outbox'}" @click="view(null,'outbox')">↗ <span class="nav-label">{{t('Outbox','发件箱')}}</span><small v-if="pendingOutbox" class="count">{{pendingOutbox}}</small></button>
+      <div class="section accounts-header">{{t('ORGANIZE','邮件管理')}}</div>
+      <button class="nav-row" @click="openOrganizer('contacts')" :disabled="busy">♙ <span class="nav-label">{{t('Contacts','联系人')}}</span></button>
+      <button class="nav-row" @click="openOrganizer('templates')" :disabled="busy">▧ <span class="nav-label">{{t('Templates','邮件模板')}}</span></button>
+      <button class="nav-row" @click="openOrganizer('rules')" :disabled="busy">⚙ <span class="nav-label">{{t('Mail rules','邮件规则')}}</span></button>
+      <button class="nav-row" @click="openOrganizer('searches')" :disabled="busy">⌕ <span class="nav-label">{{t('Saved searches','保存的搜索')}}</span></button>
+      <button v-for="s in savedSearches" :key="'saved-'+s.id" class="nav-row folder-row" :class="{active:activeSavedId===s.id}" @click="useSavedSearch(s)"><span class="nav-label">{{s.name}}</span></button>
+      <button v-for="l in labels" :key="'label-'+l.name" class="nav-row folder-row" :class="{active:!activeSavedId&&appliedFilters.label===l.name}" @click="viewLabel(l.name)"><span class="folder-symbol">◈</span><span class="nav-label">{{l.name}}</span><small class="count">{{l.unread||l.total}}</small></button>
       <div class="section accounts-header">{{t('ACCOUNTS','邮箱账号')}}<button @click="newAccount" :title="t('Add account','添加账号')">＋</button></div>
       <div v-for="a in accounts" :key="a.id" class="account-group">
         <div class="account-heading"><button class="expand" @click="toggleExpand(a.id)" :aria-expanded="expanded.includes(a.id)" :aria-label="t('Toggle folders','展开或收起文件夹')">{{expanded.includes(a.id)?'⌄':'›'}}</button>
@@ -340,17 +411,18 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
     <div class="split" role="separator" aria-orientation="vertical" @pointerdown="resize($event,'nav')"></div>
     <section class="message-list">
       <div class="list-head"><h1>{{title}}</h1><div class="toolbar">
-        <template v-if="mode!=='drafts'"><button @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button></template>
+        <template v-if="mode!=='drafts'&&mode!=='outbox'"><button @click="sync()" :disabled="busy||currentFolder?.available===false">↻ {{t('Sync','同步')}}</button><button v-if="currentAccount" @click="sync(true)" :disabled="busy">{{t('Sync all folders','同步全部文件夹')}}</button><button v-if="currentAccount" @click="testAccount" :disabled="busy">{{t('Test','测试')}}</button><button v-if="currentAccount" @click="editAccount" :disabled="busy">{{t('Edit account','编辑账号')}}</button><button v-if="currentAccount&&currentAccount.auth_kind!=='password'" @click="startOAuth(currentAccount)" :disabled="busy">{{t('Reauthorize','重新授权')}}</button><button v-if="currentAccount" class="danger-text" @click="remove" :disabled="busy">{{t('Remove','移除')}}</button></template>
+        <template v-else-if="mode==='outbox'"><button :disabled="busy" @click="run(refreshOutbox)">↻ {{t('Refresh','刷新')}}</button><button @click="compose">{{t('New message','写邮件')}}</button></template>
         <button v-else @click="compose">{{t('New draft','新建草稿')}}</button>
       </div></div>
-      <form v-if="advanced&&mode!=='drafts'" class="advanced-search" @submit.prevent="applySearch">
+      <form v-if="advanced&&mode!=='drafts'&&mode!=='outbox'" class="advanced-search" @submit.prevent="applySearch">
         <label>{{t('Sender','发件人')}}<input v-model="filters.sender"></label><label>{{t('Recipient','收件人')}}<input v-model="filters.recipient"></label>
-        <label>{{t('Subject','主题')}}<input v-model="filters.subject"></label>
+        <label>{{t('Subject','主题')}}<input v-model="filters.subject"></label><label>{{t('Category','分类')}}<select v-model="filters.label"><option value="">{{t('All categories','全部分类')}}</option><option v-for="l in labels" :key="l.name" :value="l.name">{{l.name}}</option></select></label>
         <div class="search-dates"><label>{{t('From','开始日期')}}<input v-model="filters.fromDate" type="date"></label><label>{{t('Through','结束日期')}}<input v-model="filters.toDate" type="date"></label></div>
         <div class="search-filter-actions"><button type="button" @click="clearSearch">{{t('Clear','清除')}}</button><button class="primary">{{t('Apply filters','应用筛选')}}</button></div>
       </form>
-      <div class="list-meta">{{mode==='drafts'?currentDrafts.length:messages.length}} {{t('loaded','封已加载')}} <span v-if="loading">{{t('Loading…','加载中…')}}</span></div>
-      <div v-if="mode!=='drafts'&&messages.length" class="batch-toolbar">
+      <div class="list-meta">{{mode==='outbox'?currentOutbox.length:mode==='drafts'?currentDrafts.length:messages.length}} {{t('loaded','封已加载')}} <span v-if="loading">{{t('Loading…','加载中…')}}</span></div>
+      <div v-if="mode!=='drafts'&&mode!=='outbox'&&messages.length" class="batch-toolbar">
         <label class="batch-select"><input type="checkbox" :checked="messages.every(m=>batchIds.includes(m.id))" :disabled="busy" @change="toggleAllBatch">{{batchIds.length?t('Selected ','已选 ')+batchIds.length:t('Select loaded','选择已加载')}}</label>
         <template v-if="batchIds.length">
           <button :disabled="busy" @click="applyBatch('read')">{{t('Read','已读')}}</button><button :disabled="busy" @click="applyBatch('unread')">{{t('Unread','未读')}}</button>
@@ -359,7 +431,17 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
           <div v-if="batchFolders.length" class="batch-move"><select v-model="batchDestination" :disabled="busy" :aria-label="t('Move destination','移动目标')"><option value="">{{t('Choose folder','选择文件夹')}}</option><option v-for="f in batchFolders" :key="f.name" :value="f.name">{{folderLabel(f)}}</option></select><button :disabled="busy||!batchDestination" @click="applyBatch('move')">{{t('Move','移动')}}</button></div>
         </template>
       </div>
-      <div class="items" v-if="mode==='drafts'">
+      <div class="items" v-if="mode==='outbox'">
+        <div class="outbox-note">{{t('Scheduled messages send when due while Mail EX is running, including minimized. Overdue queued mail sends on the next launch. Uncertain or interrupted sends are never automatically retried.','Mail EX 运行期间（含最小化）会发送到期邮件；关机或退出期间到期的邮件在下次启动时处理。结果不确定或中断的邮件绝不自动重发。')}}</div>
+        <div v-for="o in currentOutbox" :key="o.id" class="outbox-row">
+          <div class="outbox-heading"><strong>{{o.subject||t('(No subject)','（无主题）')}}</strong><span class="outbox-state" :data-state="o.state">{{outboxState(o)}}</span></div>
+          <small>{{o.recipients}} · {{owner(o.account_id)?.name||o.account_id}}</small><small>{{o.due_at?date(o.due_at):t('Immediate delivery','立即发送')}}</small>
+          <p v-if="o.detail" class="hint">{{o.detail}}</p>
+          <div class="outbox-actions"><button v-if="o.state==='queued'" :disabled="busy" @click="cancelQueued(o)">{{t('Cancel','取消')}}</button><button v-if="o.state==='sending'" :disabled="busy" @click="resolveInterrupted(o)">{{t('Mark interrupted','标为中断')}}</button><template v-if="['accepted','uncertain','canceled'].includes(o.state)"><button :disabled="busy" @click="copyQueued(o)">{{t('Copy to draft','复制为草稿')}}</button><button class="danger-text" :disabled="busy" @click="removeQueued(o)">{{t('Delete record','删除记录')}}</button></template></div>
+        </div>
+        <div class="empty" v-if="!currentOutbox.length"><span>↗</span><p>{{t('No outbox records','没有发件箱记录')}}</p></div>
+      </div>
+      <div class="items" v-else-if="mode==='drafts'">
         <div v-for="d in currentDrafts" :key="d.id" class="draft-row"><button class="mail-row" @click="editDraft(d)" :disabled="busy"><div class="mail-line"><strong>{{d.mail.subject||t('(No subject)','（无主题）')}}</strong><time>{{date(d.updated_at)}}</time></div><div class="subject">{{d.mail.to||t('No recipient','未填写收件人')}}</div><small>{{owner(d.mail.account_id)?.name}}</small></button><button class="delete-draft" @click="deleteDraft(d)" :disabled="busy" :title="t('Delete local draft','删除本地草稿')">×</button></div>
         <div class="empty" v-if="!currentDrafts.length"><span>✎</span><p>{{t('No local drafts','没有本地草稿')}}</p></div>
       </div>
@@ -383,7 +465,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
         </div>
         
         <article>
-          <h2>{{selected.subject||t('(No subject)','（无主题）')}}</h2><div class="sender">{{selected.sender}}</div><div class="muted">{{t('To: ','收件人：')}}{{selected.recipients}}</div><div class="muted">{{owner(selected.account_id)?.email}} · {{date(selected.timestamp)}}</div>
+          <h2>{{selected.subject||t('(No subject)','（无主题）')}}</h2><div class="sender">{{selected.sender}}</div><div class="muted">{{t('To: ','收件人：')}}{{selected.recipients}}</div><div class="muted">{{owner(selected.account_id)?.email}} · {{date(selected.timestamp)}}</div><div v-if="messageLabels.length" class="message-labels"><button v-for="label in messageLabels" :key="label" @click="viewLabel(label)">{{label}}</button></div>
           <div v-if="selected.attachments.length" class="attachment-panel">
             <div class="attachment-title">{{t('Attachments','附件')}} ({{selected.attachments.length}})</div>
             <div class="attachment-row" v-for="a in selected.attachments" :key="a.index">
@@ -398,7 +480,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
           <pre v-else class="body">{{selected.body}}</pre>
         </article>
       </template>
-      <div v-else class="empty reading-empty"><span>✉</span><h2>{{mode==='drafts'?t('Choose a draft to edit','选择草稿进行编辑'):t('Select a message','选择一封邮件')}}</h2><p>{{t('Your mail stays on your device.','邮件保存在你的设备中。')}}</p></div>
+      <div v-else class="empty reading-empty"><span>✉</span><h2>{{mode==='outbox'?t('Local delivery queue','本地发送队列'):mode==='drafts'?t('Choose a draft to edit','选择草稿进行编辑'):t('Select a message','选择一封邮件')}}</h2><p>{{t('Your mail stays on your device.','邮件保存在你的设备中。')}}</p></div>
     </section>
   </main>
   <footer role="status"><span>{{busy?t('Working…','处理中…'):t('Ready','就绪')}}</span><span>{{status}}</span><span class="error" v-if="error">{{error}}</span></footer>
@@ -440,18 +522,21 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
 
       <fieldset class="compose-fields" :disabled="busy">
         <label>{{t('From','发件人')}}<select v-model="draft.account_id" required><option v-for="a in accounts" :key="a.id" :value="a.id">{{a.email}}</option></select></label>
-        <label>{{t('To (comma-separated addresses)','收件人（逗号分隔地址）')}}<input v-model="draft.to" required></label>
-        <div class="compose-addresses"><label>Cc<input v-model="draft.cc"></label><label>Bcc<input v-model="draft.bcc"></label></div>
+        <label>{{t('To (comma-separated addresses)','收件人（逗号分隔地址）')}}<RecipientField v-model="draft.to" :contacts="contacts" :zh="zh" required/></label>
+        <div class="compose-addresses"><label>Cc<RecipientField v-model="draft.cc" :contacts="contacts" :zh="zh"/></label><label>Bcc<RecipientField v-model="draft.bcc" :contacts="contacts" :zh="zh"/></label></div>
         <label>{{t('Subject','主题')}}<input v-model="draft.subject"></label>
+        <div class="template-controls"><select v-model="templateChoice" :aria-label="t('Mail template','邮件模板')"><option value="">{{t('Choose a template','选择邮件模板')}}</option><option v-for="m in templates" :key="m.id" :value="m.id">{{m.name}}</option></select><button type="button" :disabled="!templateChoice" @click="applyTemplate">{{t('Apply','应用')}}</button><input v-model="templateName" :placeholder="t('New template name','新模板名称')"><button type="button" :disabled="!templateName.trim()" @click="saveCurrentTemplate">{{t('Save as template','保存为模板')}}</button></div>
         <div class="compose-options"><button type="button" :class="{active:!rich}" @click="changeFormat('plain')">{{t('Plain text','纯文本')}}</button><button type="button" :class="{active:rich}" @click="changeFormat('rich')">{{t('Rich text','富文本')}}</button><button v-if="owner(draft.account_id)?.signature" type="button" @click="insertSignature">{{t('Insert signature','插入签名')}}</button><button type="button" @click="attachmentInput?.click()">＋ {{t('Attach files','添加附件')}}</button><input ref="attachmentInput" class="file-input" type="file" multiple @change="addFiles"></div>
         <RichEditor v-if="rich" :html="draft.html||''" :zh="zh" :disabled="busy" @update="richUpdate"/>
         <textarea v-else class="compose-body" v-model="draft.body" :placeholder="t('Write your message…','撰写邮件正文…')" rows="12"></textarea>
         <div v-if="composeFiles.length" class="attachment-panel"><div class="attachment-title">{{t('Attachments','附件')}} ({{composeFiles.length}})</div><div v-for="(a,i) in composeFiles" :key="i" class="attachment-row"><span class="attachment-icon">▤</span><div class="attachment-name"><strong>{{a.name}}</strong><small>{{fileSize(attachedSize(a))}}</small></div><button type="button" @click="removeAttachment(i)">×</button></div></div>
         <label class="inline-label"><input type="checkbox" v-model="draft.save_sent_copy"> {{t('Save an additional copy to the server Sent folder (turn off when the provider does this automatically)','额外保存副本到服务器已发送文件夹（服务商自动保存时请关闭）')}}</label>
+        <label class="inline-label"><input type="checkbox" v-model="scheduleEnabled"> {{t('Schedule delivery','定时发送')}}</label><label v-if="scheduleEnabled">{{t('Local send time','本地发送时间')}}<input type="datetime-local" v-model="scheduleAt" required><small>{{t('Mail EX must be running; overdue mail sends on the next launch.','Mail EX 需保持运行；退出期间到期的邮件将在下次启动时发送。')}}</small></label>
         <label class="inline-label"><input type="checkbox" v-model="autosave"> {{t('Automatically save local drafts while editing','编辑时自动保存本地草稿')}} <small>{{dirty?t('Unsaved changes','未保存修改'):draftId?t('Saved','已保存'):''}}</small></label>
       </fieldset>
-      <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Close','关闭')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{t('Send','发送')}}</button></div>
+      <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Close','关闭')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{scheduleEnabled?t('Schedule','加入定时队列'):t('Send','发送')}}</button></div>
     </form>
   </div>
+  <OrganizerPanel v-if="organizerTab" :initial-tab="organizerTab" :zh="zh" :accounts="accounts" :search-seed="searchSeed" @close="organizerTab=null" @changed="organizerChanged" @use-search="useSavedSearch"/>
 </div>
 </template>

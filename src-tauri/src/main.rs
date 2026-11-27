@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport};
-use tauri::{AppHandle,Manager};
+use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport,Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem};
+use tauri::{AppHandle,Manager,Emitter};
 use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
 static OAUTH:Mutex<Option<Arc<AtomicBool>>>=Mutex::new(None);
 struct OAuthGuard;
@@ -81,10 +81,62 @@ async fn delete_draft(app:AppHandle,id:String)->Result<(),String>{work(app,move|
 async fn compose_from(app:AppHandle,id:i64,mode:String)->Result<Compose,String>{work(app,move|s|s.compose_from(id,&mode)).await}
 #[tauri::command]
 async fn send_mail(app:AppHandle,mail:Compose)->Result<SendReport,String>{work(app,move|s|s.send(mail)).await}
+#[tauri::command]
+async fn list_contacts(app:AppHandle)->Result<Vec<Contact>,String>{work(app,move|s|s.contacts()).await}
+#[tauri::command]
+async fn save_contact(app:AppHandle,contact:Contact)->Result<Contact,String>{work(app,move|s|s.save_contact(contact)).await}
+#[tauri::command]
+async fn delete_contact(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_contact(&id)).await}
+#[tauri::command]
+async fn list_templates(app:AppHandle)->Result<Vec<MailTemplate>,String>{work(app,move|s|s.templates()).await}
+#[tauri::command]
+async fn save_template(app:AppHandle,template:MailTemplate)->Result<MailTemplate,String>{work(app,move|s|s.save_template(template)).await}
+#[tauri::command]
+async fn delete_template(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_template(&id)).await}
+#[tauri::command]
+async fn list_saved_searches(app:AppHandle)->Result<Vec<SavedSearch>,String>{work(app,move|s|s.saved_searches()).await}
+#[tauri::command]
+async fn save_search(app:AppHandle,search:SavedSearch)->Result<SavedSearch,String>{work(app,move|s|s.save_search(search)).await}
+#[tauri::command]
+async fn delete_search(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_search(&id)).await}
+#[tauri::command]
+async fn list_rules(app:AppHandle)->Result<Vec<MailRule>,String>{work(app,move|s|s.rules()).await}
+#[tauri::command]
+async fn save_rule(app:AppHandle,rule:MailRule)->Result<MailRule,String>{work(app,move|s|s.save_rule(rule)).await}
+#[tauri::command]
+async fn delete_rule(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_rule(&id)).await}
+#[tauri::command]
+async fn preview_rule(app:AppHandle,rule:MailRule)->Result<usize,String>{work(app,move|s|s.preview_rule(rule)).await}
+#[tauri::command]
+async fn apply_rule(app:AppHandle,id:String)->Result<RuleReport,String>{work(app,move|s|s.apply_rule(&id)).await}
+#[tauri::command]
+async fn list_labels(app:AppHandle)->Result<Vec<LabelCount>,String>{work(app,move|s|s.labels()).await}
+#[tauri::command]
+async fn message_labels(app:AppHandle,id:i64)->Result<Vec<String>,String>{work(app,move|s|s.message_labels(id)).await}
+#[tauri::command]
+async fn list_outbox(app:AppHandle)->Result<Vec<OutboxItem>,String>{work(app,move|s|s.outbox()).await}
+#[tauri::command]
+async fn enqueue_mail(app:AppHandle,request_id:String,mail:Compose,due_at:i64,draft_id:Option<String>)->Result<OutboxItem,String>{work(app,move|s|s.enqueue_mail(request_id,mail,due_at,draft_id)).await}
+#[tauri::command]
+async fn dispatch_outbox(app:AppHandle,id:Option<String>)->Result<Option<OutboxItem>,String>{work(app,move|s|s.dispatch_outbox(id)).await}
+#[tauri::command]
+async fn cancel_outbox(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.cancel_outbox(&id)).await}
+#[tauri::command]
+async fn mark_interrupted_outbox(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.mark_interrupted_outbox(&id)).await}
+#[tauri::command]
+async fn copy_outbox(app:AppHandle,id:String)->Result<Compose,String>{work(app,move|s|s.copy_outbox(&id)).await}
+#[tauri::command]
+async fn delete_outbox(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_outbox(&id)).await}
 fn main(){
     tauri::Builder::default().plugin(tauri_plugin_dialog::init()).setup(|app| {
         let dir=app.path().app_data_dir()?;
         Store::open(&dir)?;
+        let handle=app.handle().clone();
+        std::thread::spawn(move||loop {
+            let result=Store::open(&dir).and_then(|mut store|store.dispatch_outbox(None));
+            if let Ok(Some(item))=result { let _=handle.emit("outbox-changed",item.id); }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
         Ok(())
-    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
+    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
 }

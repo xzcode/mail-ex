@@ -9,6 +9,8 @@ use std::{collections::HashSet, fs::{self, OpenOptions}, io::Write, net::{TcpStr
 use uuid::Uuid;
 mod mime;
 mod oauth;
+mod organizer;
+pub use organizer::{Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem};
 pub use oauth::OAuthRequest;
 pub use mime::{AttachmentInfo, AttachmentPreview, OutgoingAttachment};
 
@@ -56,9 +58,9 @@ pub struct SyncReport { pub added: usize, pub folders: usize }
 #[derive(Serialize)]
 pub struct SendReport { pub sent_copy: String }
 const ACCOUNT_COLUMNS: &str = "id,name,email,username,imap_host,imap_port,smtp_host,smtp_port,smtp_starttls,color,signature,auth_kind";
-#[derive(Default,Clone,Deserialize)]
+#[derive(Default,Clone,Serialize,Deserialize)]
 #[serde(default)]
-pub struct SearchFilters { pub sender:String, pub recipient:String, pub subject:String, pub since:Option<i64>,pub until:Option<i64> }
+pub struct SearchFilters { pub sender:String, pub recipient:String, pub subject:String, pub since:Option<i64>,pub until:Option<i64>,pub label:String }
 #[derive(Serialize)]
 pub struct BatchFailure{pub id:i64,pub reason:String}
 #[derive(Default,Serialize)]
@@ -113,11 +115,11 @@ impl Store {
         db.busy_timeout(Duration::from_secs(15))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let initial_version:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if initial_version>5 { bail!("Database belongs to a newer Mail EX version") }
-        if initial_version<5 {
+        if initial_version>6 { bail!("Database belongs to a newer Mail EX version") }
+        if initial_version<6 {
         let migration=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version:i64=migration.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version>5 { bail!("Database belongs to a newer Mail EX version") }
+        if version>6 { bail!("Database belongs to a newer Mail EX version") }
         if version==0 {
             migration.execute_batch("CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL, imap_port INTEGER NOT NULL, smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL, smtp_starttls INTEGER NOT NULL, color TEXT NOT NULL, secret BLOB NOT NULL);
               CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, folder TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, timestamp INTEGER NOT NULL, seen INTEGER NOT NULL, body TEXT NOT NULL, html_only INTEGER NOT NULL, raw BLOB NOT NULL, UNIQUE(account_id,folder,uid_validity,uid));
@@ -168,6 +170,7 @@ impl Store {
             };
             for (id,body) in updates{migration.execute("UPDATE messages SET body=? WHERE id=?",params![body,id])?;}
         }
+        if version<6 { organizer::migrate(&migration)?; }
         migration.commit()?;
         }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(dir.join("mail.sqlite3"),fs::Permissions::from_mode(0o600))?; }
@@ -359,9 +362,9 @@ impl Store {
         let indexed=query.chars().count()>=3&&!query.contains('\0');
         let phrase=format!("\"{}\"",query.replace('"',"\"\""));
         let fulltext=if indexed{" AND id IN (SELECT rowid FROM message_search WHERE message_search MATCH ?5)"}else{" AND (?5='' OR instr(lower(subject),lower(?5))>0 OR instr(lower(sender),lower(?5))>0 OR instr(lower(recipients),lower(?5))>0 OR instr(lower(body),lower(?5))>0)"};
-        let sql=format!("SELECT {SUMMARY_COLUMNS} FROM messages WHERE (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR folder=?2) AND (NOT ?3 OR seen=0) AND (NOT ?4 OR starred=1){fulltext} AND (?7='' OR instr(lower(sender),lower(?7))>0) AND (?8='' OR instr(lower(recipients),lower(?8))>0) AND (?9='' OR instr(lower(subject),lower(?9))>0) AND (?10 IS NULL OR timestamp>=?10) AND (?11 IS NULL OR timestamp<?11) ORDER BY timestamp DESC,id DESC LIMIT 100 OFFSET ?6");
+        let sql=format!("SELECT {SUMMARY_COLUMNS} FROM messages WHERE (?1 IS NULL OR account_id=?1) AND (?2 IS NULL OR folder=?2) AND (NOT ?3 OR seen=0) AND (NOT ?4 OR starred=1){fulltext} AND (?7='' OR instr(lower(sender),lower(?7))>0) AND (?8='' OR instr(lower(recipients),lower(?8))>0) AND (?9='' OR instr(lower(subject),lower(?9))>0) AND (?10 IS NULL OR timestamp>=?10) AND (?11 IS NULL OR timestamp<?11) AND (?12='' OR EXISTS(SELECT 1 FROM rule_labels l JOIN mail_rules r ON r.id=l.rule_id WHERE l.message_id=messages.id AND r.label=?12)) ORDER BY timestamp DESC,id DESC LIMIT 100 OFFSET ?6");
         let mut q=self.db.prepare(&sql)?;
-        let result=q.query_map(params![account_id,folder,unread,starred,if indexed{phrase.as_str()}else{query},offset,filters.sender.trim(),filters.recipient.trim(),filters.subject.trim(),filters.since,filters.until],summary_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let result=q.query_map(params![account_id,folder,unread,starred,if indexed{phrase.as_str()}else{query},offset,filters.sender.trim(),filters.recipient.trim(),filters.subject.trim(),filters.since,filters.until,filters.label.trim()],summary_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(result)
     }
     pub fn batch(&self,ids:Vec<i64>,operation:&str,destination:Option<String>)->Result<BatchReport>{
@@ -510,18 +513,10 @@ impl Store {
     }
     pub fn send(&self,mail:Compose)->Result<SendReport>{
         let a=self.account(&mail.account_id)?;let pw=self.credential(&a)?;
-        let mut builder=Message::builder().from(a.email.parse().map_err(|_|anyhow!("Invalid sender address"))?).subject(mail.subject);
-        let recipients=addresses(&mail.to)?;
-        if recipients.is_empty(){bail!("At least one recipient is required")}
-        if let Some(v)=mail.in_reply_to {if valid_message_ids(&v){builder=builder.in_reply_to(v)}}
-        if let Some(v)=mail.references {if valid_message_ids(&v){builder=builder.references(v)}}
-        for recipient in recipients{builder=builder.to(recipient)}
-        for recipient in addresses(&mail.cc)?{builder=builder.cc(recipient)}
-        for recipient in addresses(&mail.bcc)?{builder=builder.bcc(recipient)}
-        let message=mime::build_message(builder,mail.body,mail.html,mail.attachments).context("Cannot construct message")?;
+        let save_sent_copy=mail.save_sent_copy;
+        let message=prepare_message(&a,mail)?;
         smtp(&a,&pw)?.send(&message).map_err(|_|anyhow!("SMTP send failed or delivery status is uncertain; check server before retrying"))?;
-        // SMTP accepted is authoritative even if the optional IMAP sent-copy fails.
-        let sent_copy=if mail.save_sent_copy {
+        let sent_copy=if save_sent_copy {
             match self.append_sent(&a,&pw,&message){Ok(())=>"saved",Err(_)=>"failed_or_uncertain"}
         }else{"not_requested"};
         Ok(SendReport{sent_copy:sent_copy.into()})
@@ -537,6 +532,17 @@ impl Store {
     }
 }
 
+fn prepare_message(a:&Account,mail:Compose)->Result<Message>{
+    let mut builder=Message::builder().from(a.email.parse().map_err(|_|anyhow!("Invalid sender address"))?).subject(mail.subject);
+    let recipients=addresses(&mail.to)?;
+    if recipients.is_empty(){bail!("At least one recipient is required")}
+    if let Some(v)=mail.in_reply_to {if valid_message_ids(&v){builder=builder.in_reply_to(v)}}
+    if let Some(v)=mail.references {if valid_message_ids(&v){builder=builder.references(v)}}
+    for recipient in recipients{builder=builder.to(recipient)}
+    for recipient in addresses(&mail.cc)?{builder=builder.cc(recipient)}
+    for recipient in addresses(&mail.bcc)?{builder=builder.bcc(recipient)}
+    mime::build_message(builder,mail.body,mail.html,mail.attachments).context("Cannot construct message")
+}
 fn discover(session:&mut ImapSession)->Result<Vec<(String,String,String)>>{
     use imap::types::NameAttribute;
     let names=session.list(Some(""),Some("*")).context("Cannot discover mailbox folders")?;
