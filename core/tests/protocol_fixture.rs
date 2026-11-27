@@ -63,15 +63,34 @@ fn tls_imap_and_smtp_roundtrip() {
     store.sync_account(&account.id,Some("Archive".into()),false).unwrap();
     assert_eq!(store.messages(None,Some("Archive".into()),false,true,"",0).unwrap().len(),1);
     let payload=b"\x00\xffABC\n\r\n";
-    let report=store.send(Compose {
+    let outgoing=Compose {
         account_id:account.id.clone(),to:"receiver@example.invalid".into(),cc:"".into(),
         bcc:"hidden@example.invalid".into(),subject:"Fixture delivery".into(),
         body:"Local test only.".into(),in_reply_to:None,references:None,
         html:Some("<p><strong>Local test only.</strong><img src='https://tracker.invalid/a'></p>".into()),
         attachments:vec![OutgoingAttachment{name:"fixture.bin".into(),media_type:"application/octet-stream".into(),data:STANDARD.encode(payload)}],
         save_sent_copy:true,
-    }).unwrap();
+    };
+    let request=uuid::Uuid::new_v4().to_string();
+    let draft=store.save_draft(None,outgoing.clone()).unwrap();
+    let queued=store.enqueue_mail(request.clone(),outgoing.clone(),0,Some(draft)).unwrap();
+    assert_eq!(queued.state,"queued");
+    assert!(store.drafts().unwrap().is_empty());
+    store.enqueue_mail(request.clone(),outgoing.clone(),0,None).unwrap();
+    let report=store.dispatch_outbox(Some(request.clone())).unwrap().unwrap();
+    assert_eq!(report.state,"accepted");
     assert_eq!(report.sent_copy,"saved");
+    assert!(store.dispatch_outbox(Some(request.clone())).unwrap().is_none());
+    assert_eq!(store.enqueue_mail(request.clone(),outgoing.clone(),0,None).unwrap().state,"accepted");
+    assert!(store.dispatch_outbox(Some(request)).unwrap().is_none());
+    let reject_id=uuid::Uuid::new_v4().to_string();
+    let mut rejected=outgoing;
+    rejected.to="reject@example.invalid".into();
+    rejected.bcc=String::new();
+    rejected.save_sent_copy=false;
+    store.enqueue_mail(reject_id.clone(),rejected,0,None).unwrap();
+    assert_eq!(store.dispatch_outbox(Some(reject_id.clone())).unwrap().unwrap().state,"uncertain");
+    assert!(store.dispatch_outbox(Some(reject_id)).unwrap().is_none());
     let sent=store.sync_account(&account.id,Some("Sent".into()),false).unwrap();
     assert_eq!(sent.added,1);
     let sent_list=store.messages(None,Some("Sent".into()),false,false,"",0).unwrap();

@@ -36,6 +36,7 @@ MAILBOXES = {"INBOX": {1: {"raw": RAW, "flags": set()}},
 ROLES = {"INBOX": "\\HasNoChildren", "Sent": "\\Sent",
          "Archive": "\\Archive", "Trash": "\\Trash"}
 DELIVERIES = []
+REJECTED = []
 LOCK = threading.Lock()
 
 class TLSFixture(socketserver.ThreadingTCPServer):
@@ -198,8 +199,13 @@ class SMTP(Handler):
                 recipients = []
                 self.line("250 OK")
             elif command == "RCPT" and authenticated:
-                recipients.append(value)
-                self.line("250 OK")
+                if "reject@example.invalid" in value:
+                    with LOCK:
+                        REJECTED.append(value)
+                    self.line("550 5.1.1 Fixture rejection")
+                else:
+                    recipients.append(value)
+                    self.line("250 OK")
             elif command == "DATA" and authenticated and recipients:
                 self.line("354 Finish with dot")
                 data = []
@@ -256,6 +262,7 @@ def run():
             try:
                 subprocess.run(command, cwd=ROOT, env=env, check=True)
                 assert len(DELIVERIES) == 1, "Expected exactly one locally accepted SMTP message"
+                assert len(REJECTED) == 1, "Rejected outbox delivery must not automatically retry"
                 recipients, payload = DELIVERIES[0]
                 assert any("receiver@example.invalid" in r for r in recipients)
                 assert any("hidden@example.invalid" in r for r in recipients)
@@ -272,7 +279,7 @@ def run():
                     assert len(attachments) == 1
                     assert attachments[0].get_filename() == "fixture.bin"
                     assert attachments[0].get_payload(decode=True) == b"\x00\xffABC\n\r\n"
-                print("Local TLS IMAP/SMTP, safe HTML, byte-exact MIME attachments, APPEND, MOVE, flags, draft and Bcc fixture passed.")
+                print("Local TLS IMAP/SMTP, safe HTML, byte-exact MIME attachments, APPEND, MOVE, flags, draft, Bcc and durable outbox fixture passed.")
             finally:
                 imap.shutdown()
                 smtp.shutdown()
