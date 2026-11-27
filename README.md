@@ -4,11 +4,25 @@ Local-first, open-source desktop email client for Windows, macOS and Linux.
 
 [简体中文](README.zh-CN.md) · [Product specification](docs/PRODUCT.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
 
-## Development status
+## Downloads
 
-Development baseline, not a production release. Features include TLS IMAP/SMTP/POP3, unified inbox, folder sync, flags/move, safe HTML, attachments, rich text, signatures, drafts, OAuth implementation (bring your own registered desktop client), FTS5 search, batch actions, saved searches, local rules, contacts, templates, scheduled outbox, EML/MBOX/CSV/JSON exchange, backup/restore, storage maintenance, local calendar, ICS exchange, read-only CalDAV, meeting drafts and reminder implementation. M9 adds native compose/reader windows, global preferences and more themes.
+[v0.1.0 Preview](https://github.com/xzcode/mail-ex/releases/tag/v0.1.0) is the first public pre-release.
 
-Linux x86-64 native debug build, main/compose/reader Xvfb IPC smoke, and a debug DEB bundle passed. Core M8 verification: 17 unit tests and two loopback TLS integration tests. Real provider acceptance, complete native interaction, notifications, production installers and Windows/macOS builds remain pending. See [M9 notes](docs/M9.md) and [build evidence](docs/BUILD_EVIDENCE.md).
+| Platform | Installer | Verification |
+| --- | --- | --- |
+| Windows x64 | [EXE](https://github.com/xzcode/mail-ex/releases/download/v0.1.0/Mail-EX-0.1.0-windows-x64.exe) | Native CI build and core tests |
+| Linux x86-64 | [DEB](https://github.com/xzcode/mail-ex/releases/download/v0.1.0/Mail-EX-0.1.0-linux-x86_64.deb) | Optimized native build, extracted-package startup and IPC |
+| macOS ARM64 / Intel | Pending | Final DMG verification required |
+
+[SHA-256 checksums](https://github.com/xzcode/mail-ex/releases/download/v0.1.0/SHA256SUMS.txt) · [Build manifest](https://github.com/xzcode/mail-ex/releases/download/v0.1.0/build-manifest.json)
+
+This is a preview, not a production stability or actual mail-provider compatibility guarantee. Use a test mailbox first. Windows installer is not Authenticode-signed. Linux requires the declared GTK/WebKitGTK and TLS runtime dependencies.
+
+## Features
+
+ Features include TLS IMAP/SMTP/POP3, unified inbox, folder sync, flags/move, safe HTML, attachments, rich text, signatures, drafts, OAuth implementation (bring your own registered desktop client), FTS5 search, batch actions, saved searches, local rules, contacts, templates, scheduled outbox, EML/MBOX/CSV/JSON exchange, backup/restore, storage maintenance, local calendar, ICS exchange, read-only CalDAV, meeting drafts and reminder implementation. M9 adds native compose/reader windows, global preferences and more themes.
+
+Release source `21f26bf`: Linux optimized startup and installer extraction verified; 17 core unit tests and two loopback TLS protocol integration tests passed. Hosted Windows, Apple Silicon and Intel macOS core test steps passed; Windows installer artifact verified. macOS installer verification remains pending. Real provider authorization, full desktop interactions and notification display remain unverified. See [M9 notes](docs/M9.md) and [build evidence](docs/BUILD_EVIDENCE.md).
 
 ## Development
 

@@ -71,3 +71,19 @@ Native Tauri desktop build/runtime (GTK/WebKitGTK dependencies not present on th
 - `21f26bf23c7ebd3c51c3fae953fd87e2fb382ad3`: writable snapshot flush; corrected CI run 45981417804 passed the locked core test step on all three platforms. Installer build steps were still running at the last check. This is the exact application source selected for the final Linux optimized build. Final Linux frontend build passed; native recompilation, DEB bundle and extracted-package IPC smoke not yet confirmed at this checkpoint.
 - `31d168400e7d6ed83003ef1bec717a9b637f4e0f`: workflow-only fix to verify the completed DMG and codesign the app inside its read-only mount. New macOS-only dispatch was blocked by the tool's safety check; do not claim it ran. Existing runs still use the older verification procedure.
 - No production Release confirmed. Do not publish failed/unverified CI artifacts or mix different application-source revisions. System tray shutdown/notification interactions and actual providers still require runtime verification.
+
+## v0.1.0 public preview — 2026-11-27
+
+- Release application source: `21f26bf23c7ebd3c51c3fae953fd87e2fb382ad3`. All tracked Git blob hashes in the final Linux build workspace were verified against that commit. The later macOS workflow-only fix and documentation commits do not change the application.
+- Final Linux release build: locked offline optimized compilation succeeded in 1m37s after warm dependency build. Release DEB created, control/archive extraction and ldd passed in Debian container. Non-root, no-network Xvfb startup of the executable extracted from the final package completed real main-webview IPC initialization; release-smoke exited 0. The accessibility bus warning is from the isolated Xvfb environment. This is not a full interactive or fresh-system installation test.
+- Windows x64 job 140445988138 in GitHub Actions run 45981417804 completed successfully (core tests, release NSIS installer, lockfile check and upload). Downloaded artifact 15189673587, matched GitHub's artifact archive digest and verified the installer PE header. No actual Windows GUI/installation smoke was performed.
+- Final source Linux regression: `cargo test --manifest-path core/Cargo.toml --offline --locked -j 2`, 17/17 unit tests passed. `python3 scripts/protocol-fixture.py`, 2/2 local TLS integration tests passed (3.20s).
+- macOS ARM64 job 140445988155 generated ad-hoc signed DMG, but old post-bundle check failed because Tauri removed the intermediate app. Intel job was still building at the last check. Corrected workflow `31d168400e7d6ed83003ef1bec717a9b637f4e0f` mounts and verifies the completed DMG. Its dispatch was blocked during the previous work round; no final macOS artifact uploaded to the release.
+- Public GitHub pre-release ID 460455442, tag v0.1.0, target commit `21f26bf`, confirmed publication after all four assets uploaded and verified. [Release](https://github.com/xzcode/mail-ex/releases/tag/v0.1.0).
+
+| Asset | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Mail-EX-0.1.0-linux-x86_64.deb | 8839336 | 08e5f49b161678f4d70abf61703fdc5642d0437bb6e1a3eaa1d71038385a2731 |
+| Mail-EX-0.1.0-windows-x64.exe | 5314961 | aac7cc375dc678c608d0b0a4419ef8d96f02c950738928aa00bdee83ccc8ec7d |
+
+The release includes SHA256SUMS.txt and build-manifest.json. Windows is unsigned; macOS Developer ID/notarization is not configured. Real provider authorization, full desktop UX, tray/notification behavior and actual target-machine installation remain unverified. No real external messages were sent.
