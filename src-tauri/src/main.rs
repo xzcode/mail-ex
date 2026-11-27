@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport,AttachmentPreview,SendReport,OAuthRequest,SearchFilters,BatchReport,Contact,MailTemplate,SavedSearch,MailRule,LabelCount,RuleReport,OutboxItem,ImportReport,StorageStats,CacheReport,SnapshotReport,CalendarEvent,CalendarSource,NewCalendarSource,Invitation,CalendarSyncReport};
-use tauri::{AppHandle,Manager,Emitter};
+use tauri::{AppHandle,Manager,Emitter,WebviewWindow,WebviewWindowBuilder,WebviewUrl};
 use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
 static OAUTH:Mutex<Option<Arc<AtomicBool>>>=Mutex::new(None);
 struct OAuthGuard;
@@ -10,6 +10,7 @@ use tauri_plugin_notification::NotificationExt;
 use std::path::{Path,PathBuf};
 use std::fs;
 use std::io::Write;
+mod windows;
 struct DataLocation {active:PathBuf,settings:PathBuf}
 fn configured_location(settings:&Path,default:&Path)->anyhow::Result<PathBuf>{
     if !settings.exists(){return Ok(default.to_path_buf())}
@@ -101,9 +102,16 @@ async fn attachment_save(app:AppHandle,id:i64,index:usize)->Result<bool,String>{
     }).await.map_err(|_|"Attachment save task failed".to_string())?
 }
 #[tauri::command]
-async fn save_draft(app:AppHandle,id:Option<String>,mail:Compose)->Result<String,String>{work(app,move|s|s.save_draft(id,mail)).await}
+async fn save_draft(app:AppHandle,id:Option<String>,mail:Compose)->Result<String,String>{
+    let result=work(app.clone(),move|s|s.save_draft(id,mail)).await?;
+    let _=app.emit("drafts-changed",());Ok(result)
+}
 #[tauri::command]
-async fn delete_draft(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_draft(&id)).await}
+async fn delete_draft(app:AppHandle,id:String)->Result<(),String>{
+    if app.get_webview_window(&format!("compose-{id}")).is_some(){return Err("Close the draft editor before deleting this draft".into())}
+    work(app.clone(),move|s|s.delete_draft(&id)).await?;
+    let _=app.emit("drafts-changed",());Ok(())
+}
 #[tauri::command]
 async fn compose_from(app:AppHandle,id:i64,mode:String)->Result<Compose,String>{work(app,move|s|s.compose_from(id,&mode)).await}
 #[tauri::command]
@@ -143,7 +151,10 @@ async fn message_labels(app:AppHandle,id:i64)->Result<Vec<String>,String>{work(a
 #[tauri::command]
 async fn list_outbox(app:AppHandle)->Result<Vec<OutboxItem>,String>{work(app,move|s|s.outbox()).await}
 #[tauri::command]
-async fn enqueue_mail(app:AppHandle,request_id:String,mail:Compose,due_at:i64,draft_id:Option<String>)->Result<OutboxItem,String>{work(app,move|s|s.enqueue_mail(request_id,mail,due_at,draft_id)).await}
+async fn enqueue_mail(app:AppHandle,request_id:String,mail:Compose,due_at:i64,draft_id:Option<String>)->Result<OutboxItem,String>{
+    let item=work(app.clone(),move|s|s.enqueue_mail(request_id,mail,due_at,draft_id)).await?;
+    let _=app.emit("drafts-changed",());let _=app.emit("outbox-changed",&item.id);Ok(item)
+}
 #[tauri::command]
 async fn dispatch_outbox(app:AppHandle,id:Option<String>)->Result<Option<OutboxItem>,String>{work(app,move|s|s.dispatch_outbox(id)).await}
 #[tauri::command]
@@ -301,6 +312,7 @@ fn main(){
         let dir=configured_location(&settings,&root)?;
         Store::open(&dir)?;
         app.manage(DataLocation{active:dir.clone(),settings});
+        app.manage(windows::ReaderWindows::default());
         let reminder_dir=dir.clone();
         let reminder_handle=app.handle().clone();
         std::thread::spawn(move||loop {
@@ -320,5 +332,5 @@ fn main(){
             std::thread::sleep(std::time::Duration::from_secs(5));
         });
         Ok(())
-    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox,storage_stats,pending_storage,import_mail_files,export_mail_eml,export_mail_mbox,delete_local_mail,import_contacts_csv,export_contacts_csv,import_accounts_json,export_accounts_json,cache_preview,clear_cache,optimize_storage,create_backup,restore_backup,copy_storage,add_pop_account,list_calendar_events,save_calendar_event,delete_calendar_event,list_calendar_sources,add_calendar_source,remove_calendar_source,sync_calendar,import_calendar_ics,export_calendar_ics,message_invitations,add_invitation,invitation_reply,meeting_invitation,notification_enabled,set_notifications]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
+    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,authorize_account,cancel_oauth,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,batch_messages,list_drafts,get_draft,save_draft,delete_draft,compose_from,attachment_preview,attachment_save,send_mail,list_contacts,save_contact,delete_contact,list_templates,save_template,delete_template,list_saved_searches,save_search,delete_search,list_rules,save_rule,delete_rule,preview_rule,apply_rule,list_labels,message_labels,list_outbox,enqueue_mail,dispatch_outbox,cancel_outbox,mark_interrupted_outbox,copy_outbox,delete_outbox,storage_stats,pending_storage,import_mail_files,export_mail_eml,export_mail_mbox,delete_local_mail,import_contacts_csv,export_contacts_csv,import_accounts_json,export_accounts_json,cache_preview,clear_cache,optimize_storage,create_backup,restore_backup,copy_storage,add_pop_account,list_calendar_events,save_calendar_event,delete_calendar_event,list_calendar_sources,add_calendar_source,remove_calendar_source,sync_calendar,import_calendar_ics,export_calendar_ics,message_invitations,add_invitation,invitation_reply,meeting_invitation,notification_enabled,set_notifications,windows::open_compose_window,windows::open_reader_window,windows::reader_snapshot,windows::frontend_ready]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
 }

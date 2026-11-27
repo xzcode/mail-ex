@@ -6,6 +6,7 @@ export interface CalendarSource { id:string; name:string; url:string; username:s
 export interface NewCalendarSource { name:string; url:string; username:string; password:string }
 export interface Invitation { index:number; event:CalendarEvent }
 export interface CalendarSyncReport { events:number; resources:number }
+export interface ReaderSnapshot { mail:Mail; invitations:Invitation[]; labels:string[] }
 export interface ImportReport { added:number; skipped:number; invalid:number }
 export interface StorageStats { directory:string; database_bytes:number; wal_bytes:number; shm_bytes:number; raw_mail_bytes:number; messages:number; local_messages:number; accounts:number; contacts:number; drafts:number; outbox:number }
 export interface CacheReport { messages:number; raw_bytes:number }
@@ -108,6 +109,10 @@ export const api = {
   addInvitation: (id:number,index:number) => invoke<ImportReport>('add_invitation',{id,index}),
   invitationReply: (id:number,index:number,accountId:string,partstat:string) => invoke<Compose>('invitation_reply',{id,index,accountId,partstat}),
   meetingInvite: (id:string,accountId:string,recipients:string) => invoke<Compose>('meeting_invitation',{id,accountId,recipients}),
+  openComposer: (id:string) => invoke<void>('open_compose_window',{id}),
+  openReader: (id:number) => invoke<void>('open_reader_window',{id}),
+  readerSnapshot: () => invoke<ReaderSnapshot>('reader_snapshot'),
+  frontendReady: () => invoke<void>('frontend_ready'),
   notificationEnabled: () => invoke<boolean>('notification_enabled'),
   setNotifications: (enabled:boolean) => invoke<void>('set_notifications',{enabled})
 }

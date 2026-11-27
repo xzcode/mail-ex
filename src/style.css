@@ -156,3 +156,31 @@
 .invitation-card button,.invitation-actions select{font-size:12px;min-height:28px;padding:4px 8px}
 .invitation-card>button{align-self:flex-start}
 @media(max-width:780px){.calendar-grid{grid-template-columns:1fr;overflow:auto}.calendar-month,.calendar-detail{overflow:visible}.calendar-month{border-right:0;border-bottom:1px solid var(--border)}}
+
+/* M9 desktop settings and independent windows */
+.shell[data-theme="soft"]{--bg:#eceef1;--panel:#f7f7f5;--surface:#f9f9f7;--bar:#f0f0ee;--border:#d5d7d9;--fg:#29323b;--muted:#66717c;--accent:#3265b1;--active:#e1e9f7;--danger:#a92c26;color-scheme:light}
+.shell[data-theme="gray"]{--bg:#d7dade;--panel:#e4e6e8;--surface:#eff0f2;--bar:#dfe2e6;--border:#c4c9cf;--fg:#27313d;--muted:#5b6571;--accent:#365f9c;--active:#ccd9ea;--danger:#a42b27;color-scheme:light}
+.shell{--reader-font:14px}
+.shell .reading .safe-mail-html,.shell .reading .body,.reader-window-content .safe-mail-html,.reader-window-content .body{font-size:var(--reader-font);line-height:1.65}
+.shell[data-density="compact"] .mail-row{padding-top:7px;padding-bottom:7px;min-height:48px}
+.shell[data-density="compact"] .mail-row .subject{margin-top:3px}
+.shell[data-density="compact"] .nav-row{min-height:27px;padding-top:4px;padding-bottom:4px}
+.preferences-modal{width:min(690px,100%);max-height:92vh}
+.preferences-modal>.data-section{flex-shrink:0}
+.shortcut-list{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px 14px;align-items:center}
+.shortcut-list kbd{font-family:inherit;padding:4px 7px;background:var(--bar);border:1px solid var(--border);border-radius:4px;font-size:11px;color:var(--muted);text-align:right}
+.compose-window-actions{display:flex;align-items:center;gap:7px}
+.compose-window-actions button{font-size:12px}
+.standalone-compose{display:flex;flex-direction:column;position:relative}
+.standalone-compose>.overlay{position:static;flex:1;display:flex;min-height:0;background:var(--surface);padding:0;align-items:stretch;justify-content:stretch}
+.standalone-compose>.overlay>.compose-modal{border:0;border-radius:0;box-shadow:none;width:100%;max-width:none;max-height:none;height:100%;padding:18px;overflow:auto}
+.standalone-compose .compose-modal>.compose-fields{flex:1}
+.standalone-compose .compose-body{flex:1;min-height:240px}
+.standalone-compose .rich-editor{min-height:240px;flex:1}
+.detached-reader{display:flex;flex-direction:column}
+.detached-header{display:flex;align-items:center;gap:14px;padding:11px 16px;border-bottom:1px solid var(--border);background:var(--bar)}
+.detached-header>.hint{flex:1;margin:0}
+.reader-window-content{flex:1;min-height:0;overflow:auto;background:var(--surface)}
+.reader-window-content article{max-width:1000px;margin:auto;padding:23px 24px 36px}
+.reader-category{background:var(--active);color:var(--accent);border:1px solid var(--border);padding:3px 7px;border-radius:4px;font-size:11px}
+.detached-reader footer{flex-shrink:0}

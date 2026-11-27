@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, type Account, type NewAccount, type Summary, type Mail, type Compose, type Folder, type Draft, type AttachmentPreview, type OutgoingAttachment, type OAuthRequest, type BatchOperation, type SearchFilters, type Contact, type MailTemplate, type SavedSearch, type LabelCount, type OutboxItem, type Invitation } from './api'
 import {listen,type UnlistenFn} from '@tauri-apps/api/event'
+import {getCurrentWindow} from '@tauri-apps/api/window'
 import OrganizerPanel from './components/OrganizerPanel.vue'
 import RecipientField from './components/RecipientField.vue'
 import RichEditor from './components/RichEditor.vue'
@@ -11,12 +12,28 @@ import InvitationPanel from './components/InvitationPanel.vue'
 
 type View = 'inbox'|'unread'|'starred'|'all'|'folder'|'drafts'|'outbox'
 type OrganizerTab='contacts'|'templates'|'rules'|'searches'
-const zh=ref(localStorage.getItem('language')?localStorage.getItem('language')==='zh':navigator.language.toLowerCase().startsWith('zh'))
+let windowLabel='main'
+try{windowLabel=getCurrentWindow().label}catch{/* browser preview */}
+const detachedCompose=windowLabel.startsWith('compose-')
+const detachedDraftId=detachedCompose?windowLabel.slice('compose-'.length):null
+const language=ref(localStorage.getItem('language')||'system')
+const zh=computed(()=>language.value==='zh'||(language.value==='system'&&navigator.language.toLowerCase().startsWith('zh')))
+const separateCompose=ref(localStorage.getItem('separateCompose')!=='off')
+const density=ref(localStorage.getItem('density')||'comfortable')
+const readerFontSize=ref(Number(localStorage.getItem('readerFontSize')||14))
+const settingsPanel=ref(false)
+const startupError=ref('')
+let allowClose=false
+let unlistenDrafts:UnlistenFn|undefined,unlistenClose:UnlistenFn|undefined
+const searchInput=ref<HTMLInputElement|null>(null)
 const t=(en:string,cn:string)=>zh.value?cn:en
 const theme=ref(localStorage.getItem('theme')||'system')
-const autoMinutes=ref(Number(localStorage.getItem('autoMinutes')||0))
+const autoMinutes=ref(Math.max(0,Number(localStorage.getItem('autoMinutes')||0)||0))
 const navWidth=ref(Number(localStorage.getItem('navWidth'))||234), listWidth=ref(Number(localStorage.getItem('listWidth'))||355)
-watch(zh,v=>localStorage.setItem('language',v?'zh':'en'))
+watch(language,v=>localStorage.setItem('language',v))
+watch(separateCompose,v=>localStorage.setItem('separateCompose',v?'on':'off'))
+watch(density,v=>localStorage.setItem('density',v))
+watch(readerFontSize,v=>localStorage.setItem('readerFontSize',String(v)))
 watch(theme,v=>localStorage.setItem('theme',v))
 watch(autoMinutes,v=>{localStorage.setItem('autoMinutes',String(v));lastAuto=Date.now()})
 watch(navWidth,v=>localStorage.setItem('navWidth',String(v)))
@@ -164,7 +181,7 @@ async function cancelQueued(o:OutboxItem){if(confirm(t('Cancel this queued messa
 async function resolveInterrupted(o:OutboxItem){if(confirm(t('Only continue if no other Mail EX instance is sending this message. Marking it uncertain does not resend it.','请确认没有其他 Mail EX 实例正在发送此邮件。标为不确定不会再次发送。')))await run(async()=>{await api.interruptOutbox(o.id);await refreshOutbox()})}
 async function copyQueued(o:OutboxItem){
   if(o.state==='uncertain'&&!confirm(t('Verify whether the original message was delivered before creating another send request. Copy to a draft?','请先核对原邮件是否已经发送成功，再创建新的发送请求。复制为草稿？')))return
-  await run(async()=>{startCompose(await api.copyOutbox(o.id))})
+  await run(async()=>{await beginCompose(await api.copyOutbox(o.id))})
 }
 async function removeQueued(o:OutboxItem){if(confirm(t('Delete this local outbox record? Server mail is unchanged.','删除此本地发件箱记录？服务器邮件不受影响。')))await run(async()=>{await api.deleteOutbox(o.id);await refreshOutbox()})}
 
@@ -224,6 +241,7 @@ function applyPreset(){
 }
 function closeDialog(){
   if(busy.value)return
+  if(detachedCompose){void getCurrentWindow().close();return}
   if(dialog.value==='compose'&&dirty.value&&!confirm(t('Close without saving the latest changes?','关闭且不保存最近的修改？')))return
   form.value.password='';oauthForm.value.desktop_client_secret='';dialog.value=null
 }
@@ -267,21 +285,32 @@ function startCompose(mail:Compose,id:string|null=null){
   draft.value={...mail,attachments:[...(mail.attachments||[])],html:mail.html??null,save_sent_copy:mail.save_sent_copy??false}
   draftId.value=id;savedRevision.value=revision.value;dialog.value='compose';error.value='';templateChoice.value='';templateName.value='';scheduleEnabled.value=false;scheduleAt.value='';deliveryRequestId.value=newRequestId()
 }
+async function beginCompose(mail:Compose,id:string|null=null){
+  if(detachedCompose||(!separateCompose.value&&!id)){startCompose(mail,id);return}
+  const saved=id||await api.saveDraft(null,mail)
+  try{await api.openComposer(saved);await refreshDrafts()}catch(e){startCompose(mail,saved);error.value=errorText(e)}
+}
 function compose(){
   if(busy.value)return
   if(!sendingAccounts.value.length){newAccount();return}
   const mail=blankCompose(),sig=owner(mail.account_id)?.signature
   if(sig)mail.body='\n\n'+sig
-  startCompose(mail)
+  void run(()=>beginCompose(mail))
 }
-async function editDraft(d:Draft){await run(async()=>{const item=await api.draft(d.id);startCompose(item.mail,item.id)})}
+async function editDraft(d:Draft){await run(async()=>{await api.openComposer(d.id)})}
 async function reply(kind:'reply'|'reply_all'|'forward'){
   const id=selected.value?.id;if(id!==undefined)await run(async()=>{
     const mail=await api.composeFrom(id,kind),sig=owner(mail.account_id)?.signature
     if(sig)mail.body='\n\n'+sig+mail.body
-    startCompose(mail)
+    await beginCompose(mail)
   })
 }
+function handleCompose(mail:Compose){void run(()=>beginCompose(mail))}
+async function detachCurrent(){if(detachedCompose||dialog.value!=='compose')return;await run(async()=>{
+  await persistDraft(false);if(!draftId.value)return
+  await api.openComposer(draftId.value);dialog.value=null;draftId.value=null
+})}
+async function detachReader(m:Summary){if(busy.value)return;await run(()=>api.openReader(m.id))}
 function changeFormat(value:'plain'|'rich'){
   if(value==='rich'&&!rich.value)draft.value.html=escapeHtml(draft.value.body)
   if(value==='plain'&&rich.value){
@@ -335,7 +364,7 @@ async function persistDraft(close:boolean){
   draftId.value=await api.saveDraft(draftId.value,snapshot)
   savedRevision.value=current
   await refreshDrafts()
-  if(close&&revision.value===current)dialog.value=null
+  if(close&&revision.value===current){if(detachedCompose){allowClose=true;await getCurrentWindow().close()}else dialog.value=null}
   status.value=t('Draft saved locally.','草稿已保存到本地。')
 }
 async function saveDraft(){await run(async()=>{await persistDraft(true)})}
@@ -354,6 +383,7 @@ async function send(){
     const id=deliveryRequestId.value
     const item=await api.enqueue(id,{...draft.value,attachments:[...(draft.value.attachments||[])]},due,draftId.value)
     dialog.value=null;draftId.value=null;draft.value=blankCompose();savedRevision.value=revision.value
+    if(detachedCompose){allowClose=true;await getCurrentWindow().close();return}
     await refreshDrafts();await refreshOutbox();view(null,'outbox')
     status.value=due?t('Scheduled in the local outbox.','已加入本地定时发送队列。'):t('Queued for delivery.','已加入发件队列。')
     if(!due&&item.state==='queued'){
@@ -372,25 +402,67 @@ function resize(event:PointerEvent,which:'nav'|'list'){
   const done=()=>{document.removeEventListener('pointermove',move);document.removeEventListener('pointerup',done);document.removeEventListener('pointercancel',done)}
   document.addEventListener('pointermove',move);document.addEventListener('pointerup',done);document.addEventListener('pointercancel',done)
 }
+function preferenceChanged(e:StorageEvent){
+  if(e.key==='theme')theme.value=e.newValue||'system'
+  if(e.key==='language')language.value=e.newValue||'system'
+  if(e.key==='density')density.value=e.newValue||'comfortable'
+  if(e.key==='readerFontSize')readerFontSize.value=Number(e.newValue||14)
+  if(e.key==='separateCompose')separateCompose.value=e.newValue!=='off'
+  if(e.key==='autoMinutes')autoMinutes.value=Math.max(0,Number(e.newValue||0)||0)
+  if(e.key==='draftAutosave')autosave.value=e.newValue!=='off'
+}
+function keyboard(e:KeyboardEvent){
+  const mod=e.ctrlKey||e.metaKey
+  if(e.repeat)return
+  if(mod&&e.key.toLowerCase()==='s'&&dialog.value==='compose'){e.preventDefault();if(!busy.value)void saveDraft();return}
+  if(detachedCompose)return
+  if(mod&&e.key.toLowerCase()==='n'&&!dialog.value&&!calendarPanel.value&&!dataPanel.value&&!organizerTab.value&&!settingsPanel.value){e.preventDefault();compose()}
+  if(mod&&e.key.toLowerCase()==='f'&&!dialog.value&&!settingsPanel.value){e.preventDefault();searchInput.value?.focus();searchInput.value?.select()}
+  if(mod&&e.key===','&&!dialog.value&&!busy.value){e.preventDefault();settingsPanel.value=true}
+  if(e.key==='F5'&&!busy.value&&!dialog.value&&!settingsPanel.value&&!calendarPanel.value&&!organizerTab.value&&!dataPanel.value){e.preventDefault();void sync()}
+}
+function resetLayout(){navWidth.value=234;listWidth.value=355;readerFontSize.value=14;density.value='comfortable'}
 onMounted(async()=>{
-  try{await refreshAccounts();await refreshDrafts();await refreshOrganizer();await refreshOutbox();await load();unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})});unlistenReminder=await listen<number>('calendar-reminder',e=>{status.value=t('Calendar reminders: ','日程提醒：')+e.payload})}catch(e){error.value=errorText(e)}
-  timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&!dataPanel.value&&!calendarPanel.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
+  window.addEventListener('storage',preferenceChanged)
+  window.addEventListener('keydown',keyboard)
+  try{
+    await refreshAccounts();await refreshOrganizer()
+    if(detachedCompose&&detachedDraftId){
+      const item=await api.draft(detachedDraftId)
+      startCompose(item.mail,item.id)
+      unlistenClose=await getCurrentWindow().onCloseRequested(e=>{
+        if(allowClose)return
+        if(busy.value){e.preventDefault();return}
+        if(dirty.value){
+          e.preventDefault()
+          if(confirm(t('Close without saving the latest changes? The last saved draft is retained.','关闭且不保存最近修改？已保存的草稿仍会保留。'))){allowClose=true;void getCurrentWindow().close()}
+        }
+      })
+    }else{
+      await refreshDrafts();await refreshOutbox();await load()
+      unlistenOutbox=await listen<string>('outbox-changed',()=>{void refreshOutbox().catch(e=>{error.value=errorText(e)})})
+      unlistenDrafts=await listen('drafts-changed',()=>{void refreshDrafts().catch(e=>{error.value=errorText(e)})})
+      unlistenReminder=await listen<number>('calendar-reminder',e=>{status.value=t('Calendar reminders: ','日程提醒：')+e.payload})
+      timer=window.setInterval(()=>{if(autoMinutes.value>0&&!busy.value&&!loading.value&&!dialog.value&&!organizerTab.value&&!dataPanel.value&&!calendarPanel.value&&!settingsPanel.value&&Date.now()-lastAuto>=autoMinutes.value*60000)void sync(false,true)},15000)
+    }
+    await api.frontendReady()
+  }catch(e){error.value=errorText(e);if(detachedCompose)startupError.value=error.value}
   draftTimer=window.setInterval(()=>{if(autosave.value&&dialog.value==='compose'&&dirty.value&&!busy.value)void run(()=>persistDraft(false))},5000)
 })
-onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.();unlistenReminder?.()})
+onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undefined)clearInterval(draftTimer);unlistenOutbox?.();unlistenReminder?.();unlistenDrafts?.();unlistenClose?.();window.removeEventListener('storage',preferenceChanged);window.removeEventListener('keydown',keyboard)})
 </script>
 
 <template>
-<div class="shell" :data-theme="theme">
-  <header class="top">
+<div class="shell" :data-theme="theme" :data-density="density" :class="{'standalone-compose':detachedCompose}" :style="{'--reader-font':readerFontSize+'px'}">
+  <header v-if="!detachedCompose" class="top">
     <div class="brand"><span class="logo">✉</span> Mail EX</div>
-    <form class="search" @submit.prevent="applySearch"><input v-model="query" :placeholder="t('Search subject, sender, recipient, body','搜索主题、发件人、收件人、正文')" :aria-label="t('Search','搜索')"><button>{{t('Search','搜索')}}</button><button v-if="mode!=='drafts'&&mode!=='outbox'" type="button" :class="{active:advanced}" @click="advanced=!advanced">{{t('Filters','筛选')}}</button></form>
+    <form class="search" @submit.prevent="applySearch"><input ref="searchInput" v-model="query" :placeholder="t('Search subject, sender, recipient, body','搜索主题、发件人、收件人、正文')" :aria-label="t('Search','搜索')"><button>{{t('Search','搜索')}}</button><button v-if="mode!=='drafts'&&mode!=='outbox'" type="button" :class="{active:advanced}" @click="advanced=!advanced">{{t('Filters','筛选')}}</button></form>
     <div class="top-actions">
-      <select v-model.number="autoMinutes" :aria-label="t('Automatic inbox sync','自动同步收件箱')" :title="t('Automatic inbox sync while open','应用运行时自动同步收件箱')"><option :value="0">{{t('Manual sync','手动同步')}}</option><option :value="1">{{t('Every 1 min','每 1 分钟')}}</option><option :value="5">{{t('Every 5 min','每 5 分钟')}}</option><option :value="15">{{t('Every 15 min','每 15 分钟')}}</option></select>
-      <select v-model="theme" :aria-label="t('Theme','主题')"><option value="system">{{t('System','跟随系统')}}</option><option value="light">{{t('Light','浅色')}}</option><option value="dark">{{t('Dark','深色')}}</option></select><button @click="zh=!zh">{{zh?'EN':'中文'}}</button>
+      <button :disabled="busy" @click="sync()">↻ {{t('Sync','同步')}}</button>
+      <button :disabled="busy" @click="settingsPanel=true">⚙ {{t('Settings','设置')}}</button>
     </div>
   </header>
-  <main class="workspace" :style="{gridTemplateColumns:navWidth+'px 5px '+listWidth+'px 5px minmax(0,1fr)'}">
+  <main v-if="!detachedCompose" class="workspace" :style="{gridTemplateColumns:navWidth+'px 5px '+listWidth+'px 5px minmax(0,1fr)'}">
     <aside class="navigation">
       <button class="primary compose" @click="compose">＋ {{t('New message','写邮件')}}</button>
       <div class="section">{{t('UNIFIED MAIL','统一邮箱')}}</div>
@@ -460,7 +532,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
         <div class="empty" v-if="!currentDrafts.length"><span>✎</span><p>{{t('No local drafts','没有本地草稿')}}</p></div>
       </div>
       <div v-else class="items">
-        <div v-for="m in messages" :key="m.id" class="mail-select-row" :class="{checked:batchIds.includes(m.id)}"><label class="mail-checkbox" :title="t('Select message','选择邮件')"><input type="checkbox" :checked="batchIds.includes(m.id)" :disabled="busy" :aria-label="t('Select message','选择邮件')" @change="toggleBatch(m.id)"></label><button class="mail-row" :class="{selected:selected?.id===m.id,unseen:!m.seen}" @click="open(m)">
+        <div v-for="m in messages" :key="m.id" class="mail-select-row" :class="{checked:batchIds.includes(m.id)}"><label class="mail-checkbox" :title="t('Select message','选择邮件')"><input type="checkbox" :checked="batchIds.includes(m.id)" :disabled="busy" :aria-label="t('Select message','选择邮件')" @change="toggleBatch(m.id)"></label><button class="mail-row" :class="{selected:selected?.id===m.id,unseen:!m.seen}" @click="open(m)" @dblclick="detachReader(m)">
           <div class="mail-line"><span class="dot" :style="{background:owner(m.account_id)?.color||'#aaa'}"></span><strong>{{m.sender||t('(Unknown sender)','（未知发件人）')}}</strong><span v-if="m.starred" class="star">★</span><time>{{date(m.timestamp)}}</time></div>
           <div class="subject">{{m.subject||t('(No subject)','（无主题）')}}</div><small>{{owner(m.account_id)?.name}}<template v-if="m.folder!=='INBOX'"> · {{folderOf(m)?.label||m.folder}}</template></small>
         </button></div>
@@ -472,14 +544,14 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
     <section class="reading">
       <template v-if="selected">
         <div class="reader-toolbar">
-          <button @click="reply('reply')" :disabled="busy||!sendingAccounts.length">{{t('Reply','回复')}}</button><button @click="reply('reply_all')" :disabled="busy||!sendingAccounts.length">{{t('Reply all','回复全部')}}</button><button @click="reply('forward')" :disabled="busy||!sendingAccounts.length">{{t('Forward','转发')}}</button><button @click="exportSelected" :disabled="busy">{{t('Export EML','导出 EML')}}</button><button v-if="owner(selected.account_id)?.auth_kind==='local'" class="danger-text" @click="deleteLocal" :disabled="busy">{{t('Delete local mail','删除本地邮件')}}</button>
+          <button @click="reply('reply')" :disabled="busy||!sendingAccounts.length">{{t('Reply','回复')}}</button><button @click="reply('reply_all')" :disabled="busy||!sendingAccounts.length">{{t('Reply all','回复全部')}}</button><button @click="reply('forward')" :disabled="busy||!sendingAccounts.length">{{t('Forward','转发')}}</button><button @click="detachReader(selected)" :disabled="busy">{{t('Open window','独立窗口')}}</button><button @click="exportSelected" :disabled="busy">{{t('Export EML','导出 EML')}}</button><button v-if="owner(selected.account_id)?.auth_kind==='local'" class="danger-text" @click="deleteLocal" :disabled="busy">{{t('Delete local mail','删除本地邮件')}}</button>
           <button @click="toggleStar" :disabled="busy">{{selected.starred?t('Unstar','取消星标'):t('Star','星标')}}</button><button @click="toggleSeen" :disabled="busy">{{selected.seen?t('Mark unread','标为未读'):t('Mark read','标为已读')}}</button>
           <button v-if="archiveFolder" @click="moveTo(archiveFolder.name)" :disabled="busy">{{t('Archive','归档')}}</button><button v-if="trashFolder" class="danger-text" @click="moveTo(trashFolder.name)" :disabled="busy">{{t('Move to trash','移至废纸篓')}}</button>
           <div v-if="selectedFolders.length" class="move-control"><select v-model="destination" :disabled="busy" :aria-label="t('Destination folder','目标文件夹')"><option value="">{{t('Choose folder','选择文件夹')}}</option><option v-for="f in selectedFolders" :key="f.name" :value="f.name">{{folderLabel(f)}}</option></select><button @click="moveTo(destination)" :disabled="busy||!destination">{{t('Move','移动')}}</button></div>
         </div>
         
         <article>
-          <InvitationPanel v-if="invitations.length" :zh="zh" :message-id="selected.id" :invitations="invitations" :accounts="accounts" :disabled="busy" @compose="startCompose" @status="status=$event" @error="error=$event"/>
+          <InvitationPanel v-if="invitations.length" :zh="zh" :message-id="selected.id" :invitations="invitations" :accounts="accounts" :disabled="busy" @compose="handleCompose" @status="status=$event" @error="error=$event"/>
           <h2>{{selected.subject||t('(No subject)','（无主题）')}}</h2><div class="sender">{{selected.sender}}</div><div class="muted">{{t('To: ','收件人：')}}{{selected.recipients}}</div><div class="muted">{{owner(selected.account_id)?.email}} · {{date(selected.timestamp)}}</div><div v-if="messageLabels.length" class="message-labels"><button v-for="label in messageLabels" :key="label" @click="viewLabel(label)">{{label}}</button></div>
           <div v-if="selected.attachments.length" class="attachment-panel">
             <div class="attachment-title">{{t('Attachments','附件')}} ({{selected.attachments.length}})</div>
@@ -498,7 +570,8 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <div v-else class="empty reading-empty"><span>✉</span><h2>{{mode==='outbox'?t('Local delivery queue','本地发送队列'):mode==='drafts'?t('Choose a draft to edit','选择草稿进行编辑'):t('Select a message','选择一封邮件')}}</h2><p>{{t('Your mail stays on your device.','邮件保存在你的设备中。')}}</p></div>
     </section>
   </main>
-  <footer role="status"><span>{{busy?t('Working…','处理中…'):t('Ready','就绪')}}</span><span>{{status}}</span><span class="error" v-if="error">{{error}}</span></footer>
+  <footer v-if="!detachedCompose" role="status"><span>{{busy?t('Working…','处理中…'):t('Ready','就绪')}}</span><span>{{status}}</span><span class="error" v-if="error">{{error}}</span></footer>
+  <div v-if="detachedCompose&&startupError" class="empty reading-empty"><p class="error">{{startupError}}</p><button @click="getCurrentWindow().close()">{{t('Close','关闭')}}</button></div>
   <div class="overlay" v-if="dialog" @click.self="closeDialog">
     <form v-if="dialog==='account'" class="modal" @submit.prevent="saveAccount">
       <div class="modal-head"><h2>{{editId?t('Edit mailbox','编辑邮箱'):t('Add mailbox','添加邮箱')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>
@@ -535,7 +608,7 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <div class="modal-actions"><button type="button" @click="cancelOAuth" :disabled="oauthCanceling">{{t('Cancel','取消')}}</button><button class="primary" :disabled="busy">{{t('Authorize in browser','在浏览器授权')}}</button></div>
     </form>
     <form v-else class="modal compose-modal" @submit.prevent="send">
-      <div class="modal-head"><h2>{{draftId?t('Edit draft','编辑草稿'):t('New message','新邮件')}}</h2><button type="button" @click="closeDialog" :disabled="busy">×</button></div>
+      <div class="modal-head"><h2>{{draftId?t('Edit draft','编辑草稿'):t('New message','新邮件')}}</h2><div class="compose-window-actions"><button v-if="!detachedCompose" type="button" :disabled="busy" @click="detachCurrent">{{t('Open in separate window','在独立窗口打开')}}</button><button type="button" @click="closeDialog" :disabled="busy">×</button></div></div>
 
       <fieldset class="compose-fields" :disabled="busy">
         <label>{{t('From','发件人')}}<select v-model="draft.account_id" required><option v-for="a in sendingAccounts" :key="a.id" :value="a.id">{{a.email}}</option></select></label>
@@ -554,7 +627,30 @@ onUnmounted(()=>{if(timer!==undefined)clearInterval(timer);if(draftTimer!==undef
       <div class="error" v-if="error">{{error}}</div><div class="modal-actions"><button type="button" @click="closeDialog" :disabled="busy">{{t('Close','关闭')}}</button><button type="button" @click="saveDraft" :disabled="busy">{{t('Save draft','保存草稿')}}</button><button class="primary" :disabled="busy">{{scheduleEnabled?t('Schedule','加入定时队列'):t('Send','发送')}}</button></div>
     </form>
   </div>
-  <CalendarPanel v-if="calendarPanel" :zh="zh" :accounts="accounts" :contacts="contacts" @close="calendarPanel=false" @compose="calendarPanel=false;startCompose($event)"/>
+  <div v-if="settingsPanel&&!detachedCompose" class="overlay" @click.self="settingsPanel=false">
+    <section class="modal preferences-modal">
+      <div class="modal-head"><h2>{{t('Settings','全局设置')}}</h2><button @click="settingsPanel=false">×</button></div>
+      <p class="hint">{{t('Preferences are saved on this device.','设置保存在本机，自动生效。')}}</p>
+      <div class="data-section"><h3>{{t('Appearance','界面外观')}}</h3>
+        <div class="organizer-fields">
+          <label>{{t('Language','语言')}}<select v-model="language"><option value="system">{{t('Follow system','跟随系统')}}</option><option value="en">English</option><option value="zh">简体中文</option></select></label>
+          <label>{{t('Theme','主题')}}<select v-model="theme"><option value="system">{{t('Follow system','跟随系统')}}</option><option value="light">{{t('Light','浅色')}}</option><option value="soft">{{t('Soft light','柔和浅色')}}</option><option value="gray">{{t('Gray','灰色')}}</option><option value="dark">{{t('Dark','深色')}}</option></select></label>
+          <label>{{t('Message list density','邮件列表密度')}}<select v-model="density"><option value="comfortable">{{t('Comfortable','舒适')}}</option><option value="compact">{{t('Compact','紧凑')}}</option></select></label>
+          <label>{{t('Reading font size','阅读字号')}}<input v-model.number="readerFontSize" type="number" min="10" max="32" step="1"></label>
+        </div>
+        <button @click="resetLayout">{{t('Reset layout','重置布局')}}</button>
+      </div>
+      <div class="data-section"><h3>{{t('Mail behavior','邮件行为')}}</h3>
+        <label>{{t('Automatic inbox sync interval (minutes; 0 = manual)','自动同步间隔（分钟；0 为手动）')}}<input v-model.number="autoMinutes" type="number" min="0" step="1"></label>
+        <label class="inline-label"><input type="checkbox" v-model="separateCompose">{{t('Open new compose in an independent window','默认使用独立邮件撰写窗口')}}</label>
+        <label class="inline-label"><input type="checkbox" v-model="autosave">{{t('Automatically save drafts','自动保存草稿')}}</label>
+        <div class="organizer-action-row"><button @click="settingsPanel=false;dataPanel=true">{{t('Storage and backups','存储及备份')}}</button><button @click="settingsPanel=false;calendarPanel=true">{{t('Calendar and notifications','日历及通知')}}</button></div>
+      </div>
+      <div class="data-section"><h3>{{t('Keyboard shortcuts','快捷键')}}</h3><div class="shortcut-list"><span>{{t('New message','写邮件')}}</span><kbd>Ctrl / ⌘ + N</kbd><span>{{t('Search','搜索')}}</span><kbd>Ctrl / ⌘ + F</kbd><span>{{t('Synchronize','同步')}}</span><kbd>F5</kbd><span>{{t('Settings','设置')}}</span><kbd>Ctrl / ⌘ + ,</kbd><span>{{t('Save draft','保存草稿')}}</span><kbd>Ctrl / ⌘ + S</kbd></div></div>
+      <div class="modal-actions"><button class="primary" @click="settingsPanel=false">{{t('Done','完成')}}</button></div>
+    </section>
+  </div>
+  <CalendarPanel v-if="calendarPanel" :zh="zh" :accounts="accounts" :contacts="contacts" @close="calendarPanel=false" @compose="calendarPanel=false;handleCompose($event)"/>
   <DataPanel v-if="dataPanel" :zh="zh" :accounts="accounts" @close="dataPanel=false" @changed="dataChanged"/>
   <OrganizerPanel v-if="organizerTab" :initial-tab="organizerTab" :zh="zh" :accounts="accounts" :search-seed="searchSeed" @close="organizerTab=null" @changed="organizerChanged" @use-search="useSavedSearch"/>
 </div>

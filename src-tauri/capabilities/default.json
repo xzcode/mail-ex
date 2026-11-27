@@ -1,11 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Local main window only",
+  "description": "Main and local mail windows",
   "windows": [
-    "main"
+    "main",
+    "compose-*",
+    "reader-*"
   ],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-close"
   ]
 }
