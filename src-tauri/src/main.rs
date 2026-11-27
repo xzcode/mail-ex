@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose};
+use mail_ex_core::{Account,NewAccount,Store,Summary,Mail,Compose,Folder,Draft,SyncReport};
 use tauri::{AppHandle,Manager};
 
 async fn work<T:Send+'static>(app:AppHandle,f:impl FnOnce(&mut Store)->anyhow::Result<T>+Send+'static)->Result<T,String>{
@@ -11,19 +11,39 @@ async fn list_accounts(app:AppHandle)->Result<Vec<Account>,String>{work(app,|s|s
 #[tauri::command]
 async fn add_account(app:AppHandle,account:NewAccount)->Result<Account,String>{work(app,move|s|s.add_account(account)).await}
 #[tauri::command]
+async fn update_account(app:AppHandle,id:String,account:NewAccount)->Result<Account,String>{work(app,move|s|s.update_account(&id,account)).await}
+#[tauri::command]
 async fn remove_account(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.remove_account(&id)).await}
+#[tauri::command]
+async fn list_folders(app:AppHandle)->Result<Vec<Folder>,String>{work(app,|s|s.folders()).await}
 #[tauri::command]
 async fn test_account(app:AppHandle,id:String)->Result<String,String>{work(app,move|s|s.test_account(&id)).await}
 #[tauri::command]
-async fn sync_account(app:AppHandle,id:String)->Result<usize,String>{work(app,move|s|s.sync_account(&id)).await}
+async fn sync_account(app:AppHandle,id:String,folder:Option<String>,all_folders:bool)->Result<SyncReport,String>{work(app,move|s|s.sync_account(&id,folder,all_folders)).await}
 #[tauri::command]
-async fn list_messages(app:AppHandle,account_id:Option<String>,unread:bool,query:String,offset:u32)->Result<Vec<Summary>,String>{work(app,move|s|s.messages(account_id,unread,&query,offset)).await}
+async fn list_messages(app:AppHandle,account_id:Option<String>,folder:Option<String>,unread:bool,starred:bool,query:String,offset:u32)->Result<Vec<Summary>,String>{work(app,move|s|s.messages(account_id,folder,unread,starred,&query,offset)).await}
 #[tauri::command]
 async fn get_message(app:AppHandle,id:i64)->Result<Mail,String>{work(app,move|s|s.message(id)).await}
 #[tauri::command]
 async fn set_seen(app:AppHandle,id:i64,seen:bool)->Result<(),String>{work(app,move|s|s.set_seen(id,seen)).await}
 #[tauri::command]
+async fn set_starred(app:AppHandle,id:i64,starred:bool)->Result<(),String>{work(app,move|s|s.set_starred(id,starred)).await}
+#[tauri::command]
+async fn move_message(app:AppHandle,id:i64,destination:String)->Result<(),String>{work(app,move|s|s.move_message(id,&destination)).await}
+#[tauri::command]
+async fn list_drafts(app:AppHandle)->Result<Vec<Draft>,String>{work(app,|s|s.drafts()).await}
+#[tauri::command]
+async fn save_draft(app:AppHandle,id:Option<String>,mail:Compose)->Result<String,String>{work(app,move|s|s.save_draft(id,mail)).await}
+#[tauri::command]
+async fn delete_draft(app:AppHandle,id:String)->Result<(),String>{work(app,move|s|s.delete_draft(&id)).await}
+#[tauri::command]
+async fn compose_from(app:AppHandle,id:i64,mode:String)->Result<Compose,String>{work(app,move|s|s.compose_from(id,&mode)).await}
+#[tauri::command]
 async fn send_mail(app:AppHandle,mail:Compose)->Result<(),String>{work(app,move|s|s.send(mail)).await}
 fn main(){
-    tauri::Builder::default().invoke_handler(tauri::generate_handler![list_accounts,add_account,remove_account,test_account,sync_account,list_messages,get_message,set_seen,send_mail]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
+    tauri::Builder::default().setup(|app| {
+        let dir=app.path().app_data_dir()?;
+        Store::open(&dir)?;
+        Ok(())
+    }).invoke_handler(tauri::generate_handler![list_accounts,add_account,update_account,remove_account,list_folders,test_account,sync_account,list_messages,get_message,set_seen,set_starred,move_message,list_drafts,save_draft,delete_draft,compose_from,send_mail]).run(tauri::generate_context!()).expect("Mail EX desktop startup failed");
 }

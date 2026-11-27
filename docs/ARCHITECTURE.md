@@ -20,3 +20,6 @@ Secrets accepted only at account creation, never serialized in list responses. F
 
 ## Reliability
 Transactions preserve previous cache on failed sync. Account deletion cascades to local cached mail. SMTP result means server accepted the message, not end-recipient delivery; uncertain outcomes must not be automatically retried. Actual provider testing, large-mail streaming, concurrency, error localization and resilient outbox are follow-up items.
+
+## Schema and IPC extension (M2 / M3)
+See [M2/M3 notes](M2_M3.md) for schema v2, folder discovery, flags, MOVE, polling and draft/reply IPC. The original sections above describe the M1 baseline; no FTS5 or background service yet.
