@@ -304,13 +304,40 @@ async fn set_notifications(app:AppHandle,enabled:bool)->Result<(),String>{
     }).await
 }
 
+#[cfg(debug_assertions)]
+fn seed_smoke(store:&mut Store,dir:&Path)->anyhow::Result<(String,i64)>{
+    let account=store.add_account(NewAccount{name:"Local smoke fixture".into(),email:"fixture@example.invalid".into(),username:"fixture@example.invalid".into(),password:"fixture-only".into(),imap_host:"localhost".into(),imap_port:993,smtp_host:"localhost".into(),smtp_port:465,smtp_starttls:false,color:"#3469c7".into(),signature:String::new()})?;
+    let draft=store.save_draft(None,Compose{account_id:account.id,to:"recipient@example.invalid".into(),cc:String::new(),bcc:String::new(),subject:"Local draft fixture".into(),body:"Native compose fixture; never send.".into(),in_reply_to:None,references:None,html:None,attachments:Vec::new(),save_sent_copy:false})?;
+    let eml=dir.join("smoke.eml");
+    fs::write(&eml,b"From: Smoke <sender@example.invalid>\r\nTo: fixture@example.invalid\r\nSubject: Native reader fixture\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nLocal reader fixture.\r\n")?;
+    store.import_mail(&[eml.clone()],"eml")?;
+    fs::remove_file(eml)?;
+    let list=store.messages(Some(mail_ex_core::ARCHIVE_ID.into()),None,false,false,"",0)?;
+    let id=list.first().ok_or_else(||anyhow::anyhow!("Smoke message missing"))?.id;
+    Ok((draft,id))
+}
 fn main(){
     tauri::Builder::default().plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_notification::init()).setup(|app| {
-        let root=app.path().app_data_dir()?;
+        #[cfg(debug_assertions)]
+        let smoke=std::env::args().any(|arg|arg=="--smoke-fixtures");
+        #[cfg(not(debug_assertions))]
+        let smoke=false;
+        let root=if smoke{
+            let path=std::env::temp_dir().join(format!("mail-ex-native-smoke-{}",uuid::Uuid::new_v4()));
+            fs::create_dir(&path)?;path
+        }else{app.path().app_data_dir()?};
         fs::create_dir_all(&root)?;
         let settings=root.join("storage-location.json");
         let dir=configured_location(&settings,&root)?;
-        Store::open(&dir)?;
+        let store=Store::open(&dir)?;
+        #[cfg(debug_assertions)]
+        {
+            let mut store=store;
+            let targets=if smoke{Some(seed_smoke(&mut store,&dir)?)}else{None};
+            app.manage(windows::SmokeTargets(Mutex::new(targets)));
+        }
+        #[cfg(not(debug_assertions))]
+        drop(store);
         app.manage(DataLocation{active:dir.clone(),settings});
         app.manage(windows::ReaderWindows::default());
         let reminder_dir=dir.clone();

@@ -13,7 +13,7 @@ pub struct ReaderWindows(pub Mutex<HashMap<String,ReaderSnapshot>>);
 fn bring_to_front(window:&WebviewWindow)->Result<(),String>{
     window.show().map_err(|e|e.to_string())?;
     let _=window.unminimize();
-    window.set_focus().map_err(|e|e.to_string())
+    let _=window.set_focus();Ok(())
 }
 #[tauri::command]
 pub async fn open_compose_window(app:AppHandle,id:String)->Result<(),String>{
@@ -55,10 +55,25 @@ pub fn reader_snapshot(window:WebviewWindow,app:AppHandle)->Result<ReaderSnapsho
     if !window.label().starts_with("reader-"){return Err("Not a reader window".into())}
     app.state::<ReaderWindows>().0.lock().map_err(|_|"Reader snapshot unavailable".to_string())?.remove(window.label()).ok_or_else(||"Reader snapshot expired; reopen from the main mail list".into())
 }
+// The debug-only fixture is seeded in an entirely separate temporary data
+// directory. No real account, storage path or queued delivery is involved.
+#[cfg(debug_assertions)]
+pub struct SmokeTargets(pub Mutex<Option<(String,i64)>>);
 #[tauri::command]
-pub fn frontend_ready(window:WebviewWindow){
+pub fn frontend_ready(window:WebviewWindow,app:AppHandle){
     #[cfg(debug_assertions)]
-    if std::env::var_os("MAIL_EX_SMOKE").is_some(){println!("MAIL_EX_FRONTEND_READY {}",window.label());}
+    if std::env::var_os("MAIL_EX_SMOKE").is_some(){
+        println!("MAIL_EX_FRONTEND_READY {}",window.label());
+        if window.label()=="main"{
+            let targets=app.state::<SmokeTargets>().0.lock().ok().and_then(|mut state|state.take());
+            if let Some((draft,message))=targets{
+                tauri::async_runtime::spawn(async move{
+                    if let Err(e)=open_compose_window(app.clone(),draft).await{eprintln!("MAIL_EX_SMOKE_COMPOSE_ERROR {e}")}
+                    if let Err(e)=open_reader_window(app,message).await{eprintln!("MAIL_EX_SMOKE_READER_ERROR {e}")}
+                });
+            }
+        }
+    }
     #[cfg(not(debug_assertions))]
-    let _=window;
+    let _=(window,app);
 }
