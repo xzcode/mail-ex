@@ -6,7 +6,9 @@ Local-first, open-source desktop email client for Windows, macOS and Linux.
 
 ## Development status
 
-Development baseline, not a production release. Features include TLS IMAP/SMTP and POP3, unified inbox, folder sync, flags/move, safe HTML, attachments, rich text, signatures, drafts, OAuth implementation (bring your own registered desktop client), FTS5 search, batch actions, saved searches, local rules, contacts, templates, scheduled outbox, EML/MBOX/CSV/JSON exchange, backup/restore, storage maintenance, local calendar, ICS import/export, read-only CalDAV sync, meeting invitation/response drafts and opt-in notification/reminder implementation. Frontend/core builds, 17 core tests and two loopback TLS protocol tests passed. Native desktop/runtime, real provider authorization, notification display and packaging remain pending. See [M8 notes](docs/M8.md) for limitations.
+Development baseline, not a production release. Features include TLS IMAP/SMTP/POP3, unified inbox, folder sync, flags/move, safe HTML, attachments, rich text, signatures, drafts, OAuth implementation (bring your own registered desktop client), FTS5 search, batch actions, saved searches, local rules, contacts, templates, scheduled outbox, EML/MBOX/CSV/JSON exchange, backup/restore, storage maintenance, local calendar, ICS exchange, read-only CalDAV, meeting drafts and reminder implementation. M9 adds native compose/reader windows, global preferences and more themes.
+
+Linux x86-64 native debug build, main/compose/reader Xvfb IPC smoke, and a debug DEB bundle passed. Core M8 verification: 17 unit tests and two loopback TLS integration tests. Real provider acceptance, complete native interaction, notifications, production installers and Windows/macOS builds remain pending. See [M9 notes](docs/M9.md) and [build evidence](docs/BUILD_EVIDENCE.md).
 
 ## Development
 
