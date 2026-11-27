@@ -6,7 +6,7 @@ Local-first, open-source desktop email client for Windows, macOS and Linux.
 
 ## Development status
 
-Development baseline, not a production release. Features include TLS IMAP/SMTP, unified inbox and folder sync, read/star/move, safe HTML/plain reading, attachments, rich text, signatures, draft autosave, optional Sent copy, opt-in polling, desktop OAuth implementation for Gmail/Outlook.com/Microsoft 365 (bring your own registered client), FTS5 local search, batch mail actions, saved searches, automatic local category rules, contacts, rich/plain templates and a durable local outbox with scheduled delivery while the application runs. Frontend/core builds, 12 core tests and an expanded loopback TLS integration test passed. Actual provider authorization, native desktop runtime/scheduler and native notifications remain pending. See [organizer and outbox notes](docs/M5_M6.md) and [OAuth and search notes](docs/M4_M5.md).
+Development baseline, not a production release. Features include TLS IMAP/SMTP, unified inbox and folder sync, mail flags/move, safe HTML, attachments, rich text, signatures, drafts, optional Sent copy, OAuth implementation (bring your own registered desktop client), FTS5 search, batch actions, saved searches, local classification, contacts, templates, durable scheduled outbox, EML/MBOX local archive and export, contact CSV and credential-free account JSON exchange, backup/restore, storage location copy and cache maintenance. Frontend/core builds, 14 core tests and loopback TLS protocol fixture passed. Native desktop runtime, file dialogs/restart activation, real provider authorization and notifications remain pending. See [M7 data notes](docs/M7.md).
 
 ## Development
 

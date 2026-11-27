@@ -1,15 +1,14 @@
-# Handoff — M5 organizer and M6 durable outbox
+# Handoff — M7 data portability and storage
 
-Repository: xzcode/mail-ex, master. M0 design, M1/M2 baseline, most M3 source, M4 OAuth, M5 search/batch/rules/saved searches, M6 contacts/templates/outbox. Latest validation: frontend production build (all changed frontend files verified by Git blob hash), locked Rust core build, 12 unit tests and 1 expanded loopback TLS protocol fixture passed. See BUILD_EVIDENCE.md, M5_M6.md, M4_M5.md and M3_MIME.md. No new dependencies in this round.
+Repository: xzcode/mail-ex, master. M0 design, M1–M6 functionality baselines and M7 archive/backup/data maintenance implemented. Latest verification: 14 Rust unit tests, 1 loopback TLS protocol fixture and frontend production build passed. See BUILD_EVIDENCE.md, M7.md and ROADMAP.md.
 
 Priorities:
-1. Finish M5 thread/conversation grouping, attachment filters, local category continuity across folder moves, richer explicit rule actions, batch connection reuse/cancel.
-2. M6 native desktop scheduler acceptance, OS notifications, contact import/export and scheduling UX; ensure uncertain or interrupted sends are never automatically requeued. Queue transitions use stable request IDs and atomic claims. Rules currently only apply local categories.
-3. M7 backup/restore, EML/MBOX and contact import/export, cache maintenance/storage settings, security audit. Maintain schema migrations and ensure pending outbox records cannot be duplicated by restore.
-4. M4 live test using approved Google and Microsoft desktop client registrations and test mailboxes. No production client IDs or credentials included. Never borrow third-party app IDs or embed confidential secrets.
-5. Native Tauri build and interactive acceptance on supported systems; independent windows, native attachment dialog, large attachment streaming. Add desktop Cargo.lock and release CI after verified build.
-6. Sync improvements (UID checkpoints/IDLE, cancellation, per-account scheduling, safe folder CRUD). No blanket EXPUNGE. Review imap-proto warning.
+1. Complete native desktop build and interaction acceptance, especially dialogs and restart-based storage activation, independent compose/read windows, scheduling and notifications. Verify actual provider OAuth/IMAP/SMTP using approved test accounts.
+2. M8 implement CalDAV calendar, iCalendar invitations, POP3 and further provider/enterprise adapters; design and test locally without using real credentials.
+3. M7 remaining: optional passphrase-encrypted backup, migration-aware backward-schema restoration, streaming large messages, security audit. Keep restore non-destructive and never automatically resend historical/uncertain queued mail. Backups include the key; keep them private and trusted.
+4. M5 conversation threading, attachment filters, label continuity and batch connection reuse/cancellation; M2 incremental checkpoints/IDLE, safe folder management, sync cancellation.
+5. M9 polish, accessibility, desktop package verification and releases. Review imap-proto future-incompatibility warning.
 
-Reproduce: npm ci && npm run build; cargo test --manifest-path core/Cargo.toml --locked; on Linux with openssl and Python 3, python3 scripts/protocol-fixture.py (loopback only).
+Reproduce: npm ci && npm run build; cargo test --manifest-path core/Cargo.toml --locked; on Linux with openssl and Python 3, python3 scripts/protocol-fixture.py.
 
-Limitations: live providers and native desktop runtime remain unverified. Local messages/drafts/outbox/attachments are not encrypted; credentials use adjacent per-install key. Rule categories are local and tied to cached entries, automatic rules never mutate server mail. Scheduled delivery is application-process only; overdue queued mail becomes eligible on next launch. Interrupted claims remain uncertain and never auto retry. No exact-time/recipient-delivery guarantee. Batch sequential; strict sanitized HTML; no large attachment streaming. No production installer or Release.
+Limitations: native desktop/real providers not yet verified; no release. Local database and backup are not encrypted, credentials are encrypted with an adjacent per-install key. Exported account JSON contains no credentials. Backups include database and key, and checksum is not authentication. Restore accepts same schema and copies into a new directory; original remains untouched. Restored queued/sending rows are suspended, not retried; active source queue is unchanged. Changes after a copy are not transferred, and new location activates on restart. Cache cleanup excludes local imports; cleared server messages can reappear after sync. MBOX may normalize final newline, EML retains original bytes. HTML strict sanitized rendering, no large attachment streaming.
